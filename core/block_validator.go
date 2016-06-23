@@ -345,14 +345,21 @@ func calcDifficultyFrontier(time, parentTime uint64, parentNumber, parentDiff *b
 // The result may be modified by the caller.
 // This is miner strategy, not consensus protocol.
 func CalcGasLimit(parent *types.Block) *big.Int {
+	// decay = parentGasLimit / 1024 -1
+	decay := new(big.Int).Div(parent.GasLimit(), params.GasLimitBoundDivisor)
+	decay.Sub(decay, big.NewInt(1))
+
+	// Temporary special case: if DAO rupture is requested, lower gas limit if after normal
+	// calculation it's above ruptureTarget
+	if DAOSoftFork && parent.NumberU64() <= ruptureBlock && parent.GasLimit().Cmp(ruptureTarget) > 0 {
+		daoGL := new(big.Int).Sub(parent.GasLimit(), decay)
+		return daoGL
+	}
+
 	// contrib = (parentGasUsed * 3 / 2) / 1024
 	contrib := new(big.Int).Mul(parent.GasUsed(), big.NewInt(3))
 	contrib = contrib.Div(contrib, big.NewInt(2))
 	contrib = contrib.Div(contrib, params.GasLimitBoundDivisor)
-
-	// decay = parentGasLimit / 1024 -1
-	decay := new(big.Int).Div(parent.GasLimit(), params.GasLimitBoundDivisor)
-	decay.Sub(decay, big.NewInt(1))
 
 	/*
 		strategy: gasLimit of block-to-mine is set based on parent's
@@ -371,10 +378,6 @@ func CalcGasLimit(parent *types.Block) *big.Int {
 		gl.Add(parent.GasLimit(), decay)
 		gl.Set(common.BigMin(gl, params.TargetGasLimit))
 	}
-	// Temporary special case: if DAO rupture is requested, cap the gas limit
-	if DAOSoftFork && parent.NumberU64() <= ruptureBlock && gl.Cmp(ruptureTarget) > 0 {
-		gl.Sub(parent.GasLimit(), decay)
-		gl.Set(common.BigMax(gl, ruptureTarget))
-	}
+
 	return gl
 }
