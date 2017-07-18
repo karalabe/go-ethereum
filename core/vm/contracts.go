@@ -165,15 +165,28 @@ func (c *bigModexp) RequiredGas(input []byte) uint64 {
 		input = append(input, make([]byte, 3*32-len(input))...)
 	}
 	var (
-		baseLen = new(big.Int).SetBytes(input[:31])
-		expLen  = math.BigMax(new(big.Int).SetBytes(input[32:64]), big.NewInt(1))
-		modLen  = new(big.Int).SetBytes(input[65:97])
+		baseLen = new(big.Int).SetBytes(input[:32])
+		//expLen  = new(big.Int).SetBytes(input[32:64])
+		modLen = new(big.Int).SetBytes(input[64:96])
 	)
+	// Gas calulation:
+	// floor(max(length_of_MODULUS, length_of_BASE) ** 2 * max(ADJUSTED_EXPONENT_LENGTH, 1) / GQUADDIVISOR)
+	// ADJUSTED_EXPONENT_LENGTH is defined as follows.
+	// * If length_of_EXPONENT <= 32, and all bits in EXPONENT are 0, return 0
+	// * If length_of_EXPONENT <= 32, then return the index of the highest bit in EXPONENT (eg. 1 -> 0, 2 -> 1, 3 -> 1, 255 -> 7, 256 -> 8).
+	// * If length_of_EXPONENT > 32, then return 8 * (length_of_EXPONENT - 32) plus the index of the highest bit in the first 32 bytes of EXPONENT (eg. if EXPONENT = \x00\x00\x01\x00.....\x00, with one hundred bytes, then the result is 8 * (100 - 32) + 253 = 797). If all of the first 32 bytes of EXPONENT are zero, return exactly 8 * (length_of_EXPONENT - 32).
+
+	// Need to figure out the actual adjusted exponent length here.
+	// if we decide to use that formula.
+	// To do that, we need to skip the base, and read out the actual
+	// exponent, and count bits.
+	// For now, it's set to 0
+	adjExpLen := new(big.Int)
 	x := new(big.Int).Set(math.BigMax(baseLen, modLen))
 	x.Mul(x, x)
-	x.Mul(x, expLen)
+	y := math.BigMax(adjExpLen, common.Big1)
+	x.Mul(x, y)
 	x.Div(x, new(big.Int).SetUint64(params.QuadCoeffDiv))
-
 	return x.Uint64()
 }
 
@@ -187,7 +200,6 @@ func (c *bigModexp) Run(input []byte) ([]byte, error) {
 		expLen  = new(big.Int).SetBytes(input[32:64]).Uint64()
 		modLen  = new(big.Int).SetBytes(input[64:96]).Uint64()
 	)
-
 	input = input[96:]
 	if uint64(len(input)) < baseLen {
 		input = append(input, make([]byte, baseLen-uint64(len(input)))...)
