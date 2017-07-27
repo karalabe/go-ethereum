@@ -154,6 +154,41 @@ func (c *dataCopy) Run(in []byte) ([]byte, error) {
 // bigModexp implements a native big integer exponential modular operation.
 type bigModexp struct{}
 
+var big199680 = big.NewInt(199680)
+var big8 = big.NewInt(8)
+
+// multComplexity is defined in the EIP as
+// def mult_complexity(x):
+//    if x <= 64: return x ** 2
+//    elif x <= 1024: return x ** 2 // 4 + 96 * x - 3072
+//    else: return x ** 2 // 16 + 480 * x - 199680
+// This method operates destructively on the bigint
+func multComplexity(x *big.Int) *big.Int {
+	if x.Cmp(common.Big64) <= 0 {
+		return x.Mul(x, x)
+	}
+	if x.Cmp(common.Big1024) <= 0 {
+		// 96 * x
+		y := big.NewInt(96)
+		y.Mul(y, x)
+		// x ** 2  // 4
+		x.Mul(x, x)
+		x.Div(x, common.Big4)
+		// x**2 // 4 + 96*x - 3072
+		x.Add(x, y)
+		return x.Sub(x, common.Big3072)
+	}
+	// 480 * x
+	y := big.NewInt(480)
+	y.Mul(y, x)
+	// x ** 2  // 16
+	x.Mul(x, x)
+	x.Div(x, common.Big16)
+	// x**2 // 4 + 96*x - 3072
+	x.Add(x, y)
+	return x.Sub(x, big199680)
+}
+
 // RequiredGas returns the gas required to execute the pre-compiled contract.
 //
 // This method does not require any overflow checking as the input size gas costs
@@ -166,27 +201,38 @@ func (c *bigModexp) RequiredGas(input []byte) uint64 {
 	}
 	var (
 		baseLen = new(big.Int).SetBytes(input[:32])
-		//expLen  = new(big.Int).SetBytes(input[32:64])
-		modLen = new(big.Int).SetBytes(input[64:96])
+		expLen  = new(big.Int).SetBytes(input[32:64])
+		modLen  = new(big.Int).SetBytes(input[64:96])
 	)
 	// Gas calulation:
-	// floor(max(length_of_MODULUS, length_of_BASE) ** 2 * max(ADJUSTED_EXPONENT_LENGTH, 1) / GQUADDIVISOR)
-	// ADJUSTED_EXPONENT_LENGTH is defined as follows.
-	// * If length_of_EXPONENT <= 32, and all bits in EXPONENT are 0, return 0
-	// * If length_of_EXPONENT <= 32, then return the index of the highest bit in EXPONENT (eg. 1 -> 0, 2 -> 1, 3 -> 1, 255 -> 7, 256 -> 8).
-	// * If length_of_EXPONENT > 32, then return 8 * (length_of_EXPONENT - 32) plus the index of the highest bit in the first 32 bytes of EXPONENT (eg. if EXPONENT = \x00\x00\x01\x00.....\x00, with one hundred bytes, then the result is 8 * (100 - 32) + 253 = 797). If all of the first 32 bytes of EXPONENT are zero, return exactly 8 * (length_of_EXPONENT - 32).
-
-	// Need to figure out the actual adjusted exponent length here.
-	// if we decide to use that formula.
-	// To do that, we need to skip the base, and read out the actual
-	// exponent, and count bits.
-	// For now, it's set to 0
-	adjExpLen := new(big.Int)
+	// floor(mult_complexity(max(length_of_MODULUS, length_of_BASE)) * max(ADJUSTED_EXPONENT_LENGTH, 1) / GQUADDIVISOR)
 	x := new(big.Int).Set(math.BigMax(baseLen, modLen))
-	x.Mul(x, x)
-	y := math.BigMax(adjExpLen, common.Big1)
-	x.Mul(x, y)
+
+	adjExpLen := new(big.Int)
+	if expLen.Cmp(common.Big32) <= 0 {
+		a := new(big.Int).SetBytes(getData(input, baseLen, expLen))
+		if bitlen := uint64(a.BitLen()); bitlen > 0 {
+			adjExpLen.SetUint64(bitlen - 1)
+		}
+	} else {
+		adjExpLen.Mul(big8, expLen)
+		adjExpLen.Sub(adjExpLen, common.Big32)
+		a := new(big.Int).SetBytes(getData(input, baseLen, common.Big32))
+		if bitlen := uint64(a.BitLen()); bitlen > 0 {
+			z := new(big.Int).SetUint64(bitlen)
+			z.Sub(z, common.Big1)
+			adjExpLen.Add(adjExpLen, z)
+		}
+	}
+
+	multComplexity(x).Mul(x, math.BigMax(adjExpLen, common.Big1))
 	x.Div(x, new(big.Int).SetUint64(params.QuadCoeffDiv))
+	// TODO This method can overflow, if a very large
+	// length of exponent is used. This method should perhaps instead return an error.
+	// Below is a hack
+	if x.BitLen() > 64 {
+		return math.MaxUint64
+	}
 	return x.Uint64()
 }
 
