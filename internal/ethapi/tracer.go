@@ -354,6 +354,10 @@ func (jst *JavascriptTracer) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, 
 		jst.log["depth"] = depth
 		jst.log["account"] = contract.Address()
 
+		//A bit of a hack - should be placed in CaptureStart/CaptureEnd, but there's no evm in those methods
+		jst.ctx["blocknumber"] = env.BlockNumber.Uint64()
+		jst.ctx["gasLimit"] = env.GasLimit
+
 		delete(jst.log, "error")
 		if err != nil {
 			jst.log["error"] = err
@@ -375,7 +379,7 @@ func (jst *JavascriptTracer) CaptureEnd(output []byte, gasUsed uint64, t time.Du
 		jst.ctx["error"] = err.Error()
 	}
 	ctxvalue, _ := jst.vm.ToValue(jst.ctx)
-	jst.result, jst.err = jst.callSafely("result", ctxvalue)
+	jst.result, jst.err = jst.callSafely("result", ctxvalue, jst.dbvalue)
 	if jst.err != nil {
 		jst.err = wrapError("result", jst.err)
 	}
