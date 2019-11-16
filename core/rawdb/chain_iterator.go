@@ -19,6 +19,7 @@ package rawdb
 import (
 	"errors"
 	"math"
+	"math/big"
 	"runtime"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/rlp"
+	"golang.org/x/crypto/sha3"
 )
 
 type (
@@ -209,24 +212,113 @@ func InitDatabaseFromFreezer(db ethdb.Database) {
 // We can write tx index tail flag periodically even without the whole indexing
 // procedure is finished. So that we can resume indexing procedure next time quickly.
 func IndexTransactions(db ethdb.Database, from uint64, to uint64) {
-	// hashTxs calculates transaction hash in advance using the multi-routine's
-	// concurrent computing power.
-	hashTxs := func(block *types.Block) {
-		for _, tx := range block.Transactions() {
-			tx.Hash()
+	// One thread sequentially reads data from db
+	type numberRlp struct {
+		number uint64
+		rlp    rlp.RawValue
+	}
+	// A set of threads takes the rlp, and hashes the transactions
+	type delivery struct {
+		number uint64
+		hashes []common.Hash
+	}
+
+	var (
+		batch   = db.NewBatch()
+		start   = time.Now()
+		logged  = start.Add(-7 * time.Second) // Unindex during import is fast, don't double log
+		threads = to - from
+
+		rlpCh    = make(chan *numberRlp, threads*2) // we send raw rlp over this channel
+		hashesCh = make(chan *delivery, threads*2)  // send hashes over hashesCh
+		abort    = make(chan struct{})
+	)
+	if cpus := runtime.NumCPU(); threads > uint64(cpus) {
+		threads = uint64(cpus)
+	}
+
+	// lookup runs in one instance
+	lookup := func() {
+		for n := from; n < to; n++ {
+			data := ReadCanonicalBodyRLP(db, uint64(n))
+			// Feed the block to the aggregator, or abort on interrupt
+			select {
+			case rlpCh <- &numberRlp{n, data}:
+			case <-abort:
+				return
+			}
 		}
 	}
-	// writeIndices injects txlookup indices into the database.
-	writeIndices := func(batch ethdb.Batch, block *types.Block) {
-		WriteTxLookupEntries(batch, block)
-		if block.NumberU64() == to-1 || block.NumberU64()%10000 == 0 {
-			WriteTxIndexTail(batch, block.NumberU64())
+	// process runs in parallell
+	process := func() {
+		var hasher = sha3.NewLegacyKeccak256()
+		for data := range rlpCh {
+			it, err := rlp.NewListIterator(data.rlp)
+			if err != nil {
+				log.Crit("tx indexing error", "error", err)
+				return
+			}
+			it.Next()
+			txs := it.Value()
+			txIt, err := rlp.NewListIterator(txs)
+			if err != nil {
+				log.Crit("tx indexing error", "error", err)
+				return
+			}
+			var hashes []common.Hash
+			for txIt.Next() {
+				if err := txIt.Err(); err != nil {
+					log.Crit("tx indexing error", "error", err)
+					return
+				}
+				var txHash common.Hash
+				hasher.Reset()
+				hasher.Write(txIt.Value())
+				hasher.Sum(txHash[:0])
+				hashes = append(hashes, txHash)
+			}
+			result := &delivery{
+				hashes: hashes,
+				number: data.number,
+			}
+			// Feed the block to the aggregator, or abort on interrupt
+			select {
+			case hashesCh <- result:
+			case <-abort:
+				return
+			}
 		}
 	}
-	if err := iterateCanonicalChain(db, from, to, hashTxs, writeIndices, true, "Indexing transactions", "Indexed transactions"); err != nil {
-		log.Crit("Failed to index transactions", "err", err)
+	defer close(abort)
+	go lookup() // start the sequential db accessor
+	for i := 0; i < int(threads); i++ {
+		go process()
 	}
-	WriteTxIndexTail(db, from)
+	for delivery := range hashesCh {
+		number := new(big.Int).SetUint64(delivery.number).Bytes()
+		WriteTxLookupEntriesByHash(batch, number, delivery.hashes)
+
+		// If enough data was accumulated in memory or we're at the last block, dump to disk
+		if batch.ValueSize() > ethdb.IdealBatchSize {
+			if err := batch.Write(); err != nil {
+				log.Crit("Failed writing batch to db", "error", err)
+				return
+			}
+			batch.Reset()
+		}
+		// If we've spent too much time already, notify the user of what we're doing
+		if time.Since(logged) > 8*time.Second {
+			log.Info("Indexing transactions", "blocks", int64(math.Abs(float64(delivery.number-from))), "total", to-from, "elapsed", common.PrettyDuration(time.Since(start)))
+			logged = time.Now()
+		}
+	}
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed writing batch to db", "error", err)
+		return
+	}
+	log.Info("Indexed transactions", "blocks", int64(math.Abs(float64(to-from))), "total", to-from, "elapsed", common.PrettyDuration(time.Since(start)))
+
+	return
 }
 
 // UnindexTransactions removes txlookup indices of the specified block range.
