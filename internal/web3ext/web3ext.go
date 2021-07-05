@@ -153,6 +153,11 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
+			name: 'newHead',
+			call: 'admin_newHead',
+			params: 1
+		}),
+		new web3._extend.Method({
 			name: 'sleepBlocks',
 			call: 'admin_sleepBlocks',
 			params: 2
@@ -222,6 +227,11 @@ web3._extend({
 			call: 'debug_printBlock',
 			params: 1,
 			outputFormatter: console.log
+		}),
+		new web3._extend.Method({
+			name: 'getHeaderRlp',
+			call: 'debug_getHeaderRlp',
+			params: 1
 		}),
 		new web3._extend.Method({
 			name: 'getBlockRlp',
