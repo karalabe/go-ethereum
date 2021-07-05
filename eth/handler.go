@@ -308,30 +308,93 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 	// after this will be sent via broadcasts.
 	h.syncTransactions(peer)
 
+	// Create a notification channel for pending requests if the peer goes down
+	dead := make(chan struct{})
+	defer close(dead)
+
 	// If we have a trusted CHT, reject all peers below that (avoid fast sync eclipse)
 	if h.checkpointHash != (common.Hash{}) {
 		// Request the peer's checkpoint header for chain height/weight validation
-		if err := peer.RequestHeadersByNumber(h.checkpointNumber, 1, 0, false); err != nil {
+		resCh := make(chan *eth.Response)
+		if _, err := peer.RequestHeadersByNumber(h.checkpointNumber, 1, 0, false, resCh); err != nil {
 			return err
 		}
 		// Start a timer to disconnect if the peer doesn't reply in time
-		p.syncDrop = time.AfterFunc(syncChallengeTimeout, func() {
-			peer.Log().Warn("Checkpoint challenge timed out, dropping", "addr", peer.RemoteAddr(), "type", peer.Name())
-			h.removePeer(peer.ID())
-		})
-		// Make sure it's cleaned up if the peer dies off
-		defer func() {
-			if p.syncDrop != nil {
-				p.syncDrop.Stop()
-				p.syncDrop = nil
+		go func() {
+			timeout := time.NewTimer(syncChallengeTimeout)
+			defer timeout.Stop()
+
+			select {
+			case res := <-resCh:
+				headers := ([]*types.Header)(*res.Res.(*eth.BlockHeadersPacket))
+				if len(headers) == 0 {
+					// If we're doing a fast (or snap) sync, we must enforce the
+					// checkpoint block to avoid eclipse attacks. Unsynced nodes
+					// are welcome to connect after we're done joining the network.
+					if atomic.LoadUint32(&h.fastSync) == 1 {
+						peer.Log().Warn("Dropping unsynced node during sync", "addr", peer.RemoteAddr(), "type", peer.Name())
+						res.Done <- errors.New("unsynced node cannot serve sync")
+						return
+					}
+					res.Done <- nil
+					return
+				}
+				// Validate the header and either drop the peer or continue
+				if len(headers) > 1 {
+					res.Done <- errors.New("too many headers in checkpoint response")
+					return
+				}
+				if headers[0].Hash() != h.checkpointHash {
+					res.Done <- errors.New("checkpoint hash mismatch")
+					return
+				}
+				res.Done <- nil
+
+			case <-timeout.C:
+				peer.Log().Warn("Checkpoint challenge timed out, dropping", "addr", peer.RemoteAddr(), "type", peer.Name())
+				h.removePeer(peer.ID())
+
+			case <-dead:
+				// Peer handler terminated, abort all goroutines
 			}
 		}()
 	}
 	// If we have any explicit whitelist block hashes, request them
-	for number := range h.whitelist {
-		if err := peer.RequestHeadersByNumber(number, 1, 0, false); err != nil {
+	for number, hash := range h.whitelist {
+		resCh := make(chan *eth.Response)
+		if _, err := peer.RequestHeadersByNumber(number, 1, 0, false, resCh); err != nil {
 			return err
 		}
+		go func(number uint64, hash common.Hash) {
+			timeout := time.NewTimer(syncChallengeTimeout)
+			defer timeout.Stop()
+
+			select {
+			case res := <-resCh:
+				headers := ([]*types.Header)(*res.Res.(*eth.BlockHeadersPacket))
+				if len(headers) == 0 {
+					// Whitelisted blocks are allowed to be missing if the remote
+					// node is not yet synced
+					res.Done <- nil
+					return
+				}
+				// Validate the header and either drop the peer or continue
+				if len(headers) > 1 {
+					res.Done <- errors.New("too many headers in whitelist response")
+					return
+				}
+				if headers[0].Number.Uint64() != number || headers[0].Hash() != hash {
+					peer.Log().Info("Whitelist mismatch, dropping peer", "number", number, "hash", headers[0].Hash(), "want", hash)
+					res.Done <- errors.New("whitelist block mismatch")
+					return
+				}
+				peer.Log().Debug("Whitelist block verified", "number", number, "hash", hash)
+
+			case <-timeout.C:
+				peer.Log().Warn("Whitelist challenge timed out, dropping", "addr", peer.RemoteAddr(), "type", peer.Name())
+				h.removePeer(peer.ID())
+			}
+		}(number, hash)
 	}
 	// Handle incoming messages until the connection is torn down
 	return handler(peer)
