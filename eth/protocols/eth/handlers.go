@@ -277,9 +277,11 @@ func handleBlockHeaders66(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(res); err != nil {
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
-	requestTracker.Fulfil(peer.id, peer.version, BlockHeadersMsg, res.RequestId)
-
-	return backend.Handle(peer, &res.BlockHeadersPacket)
+	return peer.dispatchResponse(&Response{
+		id:   res.RequestId,
+		code: BlockHeadersMsg,
+		Res:  &res.BlockHeadersPacket,
+	})
 }
 
 func handleBlockBodies66(backend Backend, msg Decoder, peer *Peer) error {

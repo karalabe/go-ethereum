@@ -65,7 +65,8 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 	// Consume any broadcasts and announces, forwarding the rest to the downloader
 	switch packet := packet.(type) {
 	case *eth.BlockHeadersPacket:
-		return h.handleHeaders(peer, *packet)
+		log.Error("Old header handler still got called")
+		return errors.New("old header handler still got called")
 
 	case *eth.BlockBodiesPacket:
 		txset, uncleset := packet.Unpack()
@@ -104,50 +105,13 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 	}
 }
 
+/*
 // handleHeaders is invoked from a peer's message handler when it transmits a batch
 // of headers for the local node to process.
 func (h *ethHandler) handleHeaders(peer *eth.Peer, headers []*types.Header) error {
-	p := h.peers.peer(peer.ID())
-	if p == nil {
-		return errors.New("unregistered during callback")
-	}
-	// If no headers were received, but we're expencting a checkpoint header, consider it that
-	if len(headers) == 0 && p.syncDrop != nil {
-		// Stop the timer either way, decide later to drop or not
-		p.syncDrop.Stop()
-		p.syncDrop = nil
-
-		// If we're doing a fast (or snap) sync, we must enforce the checkpoint block to avoid
-		// eclipse attacks. Unsynced nodes are welcome to connect after we're done
-		// joining the network
-		if atomic.LoadUint32(&h.fastSync) == 1 {
-			peer.Log().Warn("Dropping unsynced node during sync", "addr", peer.RemoteAddr(), "type", peer.Name())
-			return errors.New("unsynced node cannot serve sync")
-		}
-	}
 	// Filter out any explicitly requested headers, deliver the rest to the downloader
 	filter := len(headers) == 1
 	if filter {
-		// If it's a potential sync progress check, validate the content and advertised chain weight
-		if p.syncDrop != nil && headers[0].Number.Uint64() == h.checkpointNumber {
-			// Disable the sync drop timer
-			p.syncDrop.Stop()
-			p.syncDrop = nil
-
-			// Validate the header and either drop the peer or continue
-			if headers[0].Hash() != h.checkpointHash {
-				return errors.New("checkpoint hash mismatch")
-			}
-			return nil
-		}
-		// Otherwise if it's a whitelisted block, validate against the set
-		if want, ok := h.whitelist[headers[0].Number.Uint64()]; ok {
-			if hash := headers[0].Hash(); want != hash {
-				peer.Log().Info("Whitelist mismatch, dropping peer", "number", headers[0].Number.Uint64(), "hash", hash, "want", want)
-				return errors.New("whitelist block mismatch")
-			}
-			peer.Log().Debug("Whitelist block verified", "number", headers[0].Number.Uint64(), "hash", want)
-		}
 		// Irrelevant of the fork checks, send the header to the fetcher just in case
 		headers = h.blockFetcher.FilterHeaders(peer.ID(), headers, time.Now())
 	}
@@ -159,7 +123,7 @@ func (h *ethHandler) handleHeaders(peer *eth.Peer, headers []*types.Header) erro
 	}
 	return nil
 }
-
+*/
 // handleBodies is invoked from a peer's message handler when it transmits a batch
 // of block bodies for the local node to process.
 func (h *ethHandler) handleBodies(peer *eth.Peer, txs [][]*types.Transaction, uncles [][]*types.Header) error {
