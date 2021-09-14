@@ -117,9 +117,6 @@ type Downloader struct {
 	ancientLimit    uint64 // The maximum block number which can be regarded as ancient data.
 
 	// Channels
-	headerCh      chan dataPack        // Channel receiving inbound block headers
-	bodyCh        chan dataPack        // Channel receiving inbound block bodies
-	receiptCh     chan dataPack        // Channel receiving inbound receipts
 	bodyWakeCh    chan bool            // Channel to signal the block body fetcher of new tasks
 	receiptWakeCh chan bool            // Channel to signal the receipt fetcher of new tasks
 	headerProcCh  chan []*types.Header // Channel to feed the header processor new tasks
@@ -218,9 +215,6 @@ func New(checkpoint uint64, stateDb ethdb.Database, stateBloom *trie.SyncBloom, 
 		blockchain:     chain,
 		lightchain:     lightchain,
 		dropPeer:       dropPeer,
-		headerCh:       make(chan dataPack, 1),
-		bodyCh:         make(chan dataPack, 1),
-		receiptCh:      make(chan dataPack, 1),
 		bodyWakeCh:     make(chan bool, 1),
 		receiptWakeCh:  make(chan bool, 1),
 		headerProcCh:   make(chan []*types.Header, 1),
@@ -394,15 +388,6 @@ func (d *Downloader) synchronise(id string, hash common.Hash, td *big.Int, mode 
 		select {
 		case <-ch:
 		default:
-		}
-	}
-	for _, ch := range []chan dataPack{d.headerCh, d.bodyCh, d.receiptCh} {
-		for empty := false; !empty; {
-			select {
-			case <-ch:
-			default:
-				empty = true
-			}
 		}
 	}
 	for empty := false; !empty; {
@@ -898,7 +883,7 @@ func (d *Downloader) findAncestorBinarySearch(p *peerConnection, mode SyncMode, 
 		}
 		if !known {
 			end = check
-			break
+			continue
 		}
 		header := d.lightchain.GetHeaderByHash(h) // Independent of sync mode, header surely exists
 		if header.Number.Uint64() != check {
@@ -1075,7 +1060,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 				}
 				// If the head is below the common ancestor, we're actually deduplicating
 				// already existing chain segments, so use the ancestor as the fake head.
-				// Otherwise we might end up delaying header deliveries pointlessly.
+				// Otherwise, we might end up delaying header deliveries pointlessly.
 				if head < ancestor {
 					head = ancestor
 				}
@@ -1131,25 +1116,7 @@ func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) (
 	log.Debug("Filling up skeleton", "from", from)
 	d.queue.ScheduleSkeleton(from, skeleton)
 
-	var (
-		deliver = func(packet dataPack) (int, error) {
-			pack := packet.(*headerPack)
-			return d.queue.DeliverHeaders(pack.peerID, pack.headers, d.headerProcCh)
-		}
-		expire  = func() map[string]int { return d.queue.ExpireHeaders(d.peers.rates.TargetTimeout()) }
-		reserve = func(p *peerConnection, count int) (*fetchRequest, bool, bool) {
-			return d.queue.ReserveHeaders(p, count), false, false
-		}
-		fetch    = func(p *peerConnection, req *fetchRequest) error { return p.FetchHeaders(d, req.From, MaxHeaderFetch) }
-		capacity = func(p *peerConnection) int { return p.HeaderCapacity(d.peers.rates.TargetRoundTrip()) }
-		setIdle  = func(p *peerConnection, accepted int, deliveryTime time.Time) {
-			p.SetHeadersIdle(accepted, deliveryTime)
-		}
-	)
-	err := d.fetchParts(d.headerCh, deliver, d.queue.headerContCh, expire,
-		d.queue.PendingHeaders, d.queue.InFlightHeaders, reserve,
-		nil, fetch, d.queue.CancelHeaders, capacity, d.peers.HeaderIdlePeers, setIdle, "headers")
-
+	err := d.concurrentFetch((*headerQueue)(d))
 	log.Debug("Skeleton fill terminated", "err", err)
 
 	filled, proced := d.queue.RetrieveHeaders()
@@ -1161,20 +1128,7 @@ func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) (
 // and also periodically checking for timeouts.
 func (d *Downloader) fetchBodies(from uint64) error {
 	log.Debug("Downloading block bodies", "origin", from)
-
-	var (
-		deliver = func(packet dataPack) (int, error) {
-			pack := packet.(*bodyPack)
-			return d.queue.DeliverBodies(pack.peerID, pack.transactions, pack.uncles)
-		}
-		expire   = func() map[string]int { return d.queue.ExpireBodies(d.peers.rates.TargetTimeout()) }
-		fetch    = func(p *peerConnection, req *fetchRequest) error { return p.FetchBodies(req) }
-		capacity = func(p *peerConnection) int { return p.BlockCapacity(d.peers.rates.TargetRoundTrip()) }
-		setIdle  = func(p *peerConnection, accepted int, deliveryTime time.Time) { p.SetBodiesIdle(accepted, deliveryTime) }
-	)
-	err := d.fetchParts(d.bodyCh, deliver, d.bodyWakeCh, expire,
-		d.queue.PendingBlocks, d.queue.InFlightBlocks, d.queue.ReserveBodies,
-		d.bodyFetchHook, fetch, d.queue.CancelBodies, capacity, d.peers.BodyIdlePeers, setIdle, "bodies")
+	err := d.concurrentFetch((*bodyQueue)(d))
 
 	log.Debug("Block body download terminated", "err", err)
 	return err
@@ -1184,223 +1138,11 @@ func (d *Downloader) fetchBodies(from uint64) error {
 // available peers, reserving a chunk of receipts for each, waiting for delivery
 // and also periodically checking for timeouts.
 func (d *Downloader) fetchReceipts(from uint64) error {
-	log.Debug("Downloading transaction receipts", "origin", from)
+	log.Debug("Downloading receipts", "origin", from)
+	err := d.concurrentFetch((*receiptQueue)(d))
 
-	var (
-		deliver = func(packet dataPack) (int, error) {
-			pack := packet.(*receiptPack)
-			return d.queue.DeliverReceipts(pack.peerID, pack.receipts)
-		}
-		expire   = func() map[string]int { return d.queue.ExpireReceipts(d.peers.rates.TargetTimeout()) }
-		fetch    = func(p *peerConnection, req *fetchRequest) error { return p.FetchReceipts(req) }
-		capacity = func(p *peerConnection) int { return p.ReceiptCapacity(d.peers.rates.TargetRoundTrip()) }
-		setIdle  = func(p *peerConnection, accepted int, deliveryTime time.Time) {
-			p.SetReceiptsIdle(accepted, deliveryTime)
-		}
-	)
-	err := d.fetchParts(d.receiptCh, deliver, d.receiptWakeCh, expire,
-		d.queue.PendingReceipts, d.queue.InFlightReceipts, d.queue.ReserveReceipts,
-		d.receiptFetchHook, fetch, d.queue.CancelReceipts, capacity, d.peers.ReceiptIdlePeers, setIdle, "receipts")
-
-	log.Debug("Transaction receipt download terminated", "err", err)
+	log.Debug("Receipt download terminated", "err", err)
 	return err
-}
-
-// fetchParts iteratively downloads scheduled block parts, taking any available
-// peers, reserving a chunk of fetch requests for each, waiting for delivery and
-// also periodically checking for timeouts.
-//
-// As the scheduling/timeout logic mostly is the same for all downloaded data
-// types, this method is used by each for data gathering and is instrumented with
-// various callbacks to handle the slight differences between processing them.
-//
-// The instrumentation parameters:
-//  - errCancel:   error type to return if the fetch operation is cancelled (mostly makes logging nicer)
-//  - deliveryCh:  channel from which to retrieve downloaded data packets (merged from all concurrent peers)
-//  - deliver:     processing callback to deliver data packets into type specific download queues (usually within `queue`)
-//  - wakeCh:      notification channel for waking the fetcher when new tasks are available (or sync completed)
-//  - expire:      task callback method to abort requests that took too long and return the faulty peers (traffic shaping)
-//  - pending:     task callback for the number of requests still needing download (detect completion/non-completability)
-//  - inFlight:    task callback for the number of in-progress requests (wait for all active downloads to finish)
-//  - throttle:    task callback to check if the processing queue is full and activate throttling (bound memory use)
-//  - reserve:     task callback to reserve new download tasks to a particular peer (also signals partial completions)
-//  - fetchHook:   tester callback to notify of new tasks being initiated (allows testing the scheduling logic)
-//  - fetch:       network callback to actually send a particular download request to a physical remote peer
-//  - cancel:      task callback to abort an in-flight download request and allow rescheduling it (in case of lost peer)
-//  - capacity:    network callback to retrieve the estimated type-specific bandwidth capacity of a peer (traffic shaping)
-//  - idle:        network callback to retrieve the currently (type specific) idle peers that can be assigned tasks
-//  - setIdle:     network callback to set a peer back to idle and update its estimated capacity (traffic shaping)
-//  - kind:        textual label of the type being downloaded to display in log messages
-func (d *Downloader) fetchParts(deliveryCh chan dataPack, deliver func(dataPack) (int, error), wakeCh chan bool,
-	expire func() map[string]int, pending func() int, inFlight func() bool, reserve func(*peerConnection, int) (*fetchRequest, bool, bool),
-	fetchHook func([]*types.Header), fetch func(*peerConnection, *fetchRequest) error, cancel func(*fetchRequest), capacity func(*peerConnection) int,
-	idle func() ([]*peerConnection, int), setIdle func(*peerConnection, int, time.Time), kind string) error {
-
-	// Create a ticker to detect expired retrieval tasks
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	update := make(chan struct{}, 1)
-
-	// Prepare the queue and fetch block parts until the block header fetcher's done
-	finished := false
-	for {
-		select {
-		case <-d.cancelCh:
-			return errCanceled
-
-		case packet := <-deliveryCh:
-			deliveryTime := time.Now()
-			// If the peer was previously banned and failed to deliver its pack
-			// in a reasonable time frame, ignore its message.
-			if peer := d.peers.Peer(packet.PeerId()); peer != nil {
-				// Deliver the received chunk of data and check chain validity
-				accepted, err := deliver(packet)
-				if errors.Is(err, errInvalidChain) {
-					return err
-				}
-				// Unless a peer delivered something completely else than requested (usually
-				// caused by a timed out request which came through in the end), set it to
-				// idle. If the delivery's stale, the peer should have already been idled.
-				if !errors.Is(err, errStaleDelivery) {
-					setIdle(peer, accepted, deliveryTime)
-				}
-				// Issue a log to the user to see what's going on
-				switch {
-				case err == nil && packet.Items() == 0:
-					peer.log.Trace("Requested data not delivered", "type", kind)
-				case err == nil:
-					peer.log.Trace("Delivered new batch of data", "type", kind, "count", packet.Stats())
-				default:
-					peer.log.Debug("Failed to deliver retrieved data", "type", kind, "err", err)
-				}
-			}
-			// Blocks assembled, try to update the progress
-			select {
-			case update <- struct{}{}:
-			default:
-			}
-
-		case cont := <-wakeCh:
-			// The header fetcher sent a continuation flag, check if it's done
-			if !cont {
-				finished = true
-			}
-			// Headers arrive, try to update the progress
-			select {
-			case update <- struct{}{}:
-			default:
-			}
-
-		case <-ticker.C:
-			// Sanity check update the progress
-			select {
-			case update <- struct{}{}:
-			default:
-			}
-
-		case <-update:
-			// Short circuit if we lost all our peers
-			if d.peers.Len() == 0 {
-				return errNoPeers
-			}
-			// Check for fetch request timeouts and demote the responsible peers
-			for pid, fails := range expire() {
-				if peer := d.peers.Peer(pid); peer != nil {
-					// If a lot of retrieval elements expired, we might have overestimated the remote peer or perhaps
-					// ourselves. Only reset to minimal throughput but don't drop just yet. If even the minimal times
-					// out that sync wise we need to get rid of the peer.
-					//
-					// The reason the minimum threshold is 2 is because the downloader tries to estimate the bandwidth
-					// and latency of a peer separately, which requires pushing the measures capacity a bit and seeing
-					// how response times reacts, to it always requests one more than the minimum (i.e. min 2).
-					if fails > 2 {
-						peer.log.Trace("Data delivery timed out", "type", kind)
-						setIdle(peer, 0, time.Now())
-					} else {
-						peer.log.Debug("Stalling delivery, dropping", "type", kind)
-
-						if d.dropPeer == nil {
-							// The dropPeer method is nil when `--copydb` is used for a local copy.
-							// Timeouts can occur if e.g. compaction hits at the wrong time, and can be ignored
-							peer.log.Warn("Downloader wants to drop peer, but peerdrop-function is not set", "peer", pid)
-						} else {
-							d.dropPeer(pid)
-
-							// If this peer was the master peer, abort sync immediately
-							d.cancelLock.RLock()
-							master := pid == d.cancelPeer
-							d.cancelLock.RUnlock()
-
-							if master {
-								d.cancel()
-								return errTimeout
-							}
-						}
-					}
-				}
-			}
-			// If there's nothing more to fetch, wait or terminate
-			if pending() == 0 {
-				if !inFlight() && finished {
-					log.Debug("Data fetching completed", "type", kind)
-					return nil
-				}
-				break
-			}
-			// Send a download request to all idle peers, until throttled
-			progressed, throttled, running := false, false, inFlight()
-			idles, total := idle()
-			pendCount := pending()
-			for _, peer := range idles {
-				// Short circuit if throttling activated
-				if throttled {
-					break
-				}
-				// Short circuit if there is no more available task.
-				if pendCount = pending(); pendCount == 0 {
-					break
-				}
-				// Reserve a chunk of fetches for a peer. A nil can mean either that
-				// no more headers are available, or that the peer is known not to
-				// have them.
-				request, progress, throttle := reserve(peer, capacity(peer))
-				if progress {
-					progressed = true
-				}
-				if throttle {
-					throttled = true
-					throttleCounter.Inc(1)
-				}
-				if request == nil {
-					continue
-				}
-				if request.From > 0 {
-					peer.log.Trace("Requesting new batch of data", "type", kind, "from", request.From)
-				} else {
-					peer.log.Trace("Requesting new batch of data", "type", kind, "count", len(request.Headers), "from", request.Headers[0].Number)
-				}
-				// Fetch the chunk and make sure any errors return the hashes to the queue
-				if fetchHook != nil {
-					fetchHook(request.Headers)
-				}
-				if err := fetch(peer, request); err != nil {
-					// Although we could try and make an attempt to fix this, this error really
-					// means that we've double allocated a fetch task to a peer. If that is the
-					// case, the internal state of the downloader and the queue is very wrong so
-					// better hard crash and note the error instead of silently accumulating into
-					// a much bigger issue.
-					panic(fmt.Sprintf("%v: %s fetch assignment failed", peer, kind))
-				}
-				running = true
-			}
-			// Make sure that we have peers available for fetching. If all peers have been tried
-			// and all failed throw an error
-			if !progressed && !throttled && !running && len(idles) == total && pendCount > 0 {
-				return errPeersUnavailable
-			}
-		}
-	}
 }
 
 // processHeaders takes batches of retrieved headers from an input channel and
@@ -1544,7 +1286,7 @@ func (d *Downloader) processHeaders(origin uint64, td *big.Int) error {
 				// Unless we're doing light chains, schedule the headers for associated content retrieval
 				if mode == FullSync || mode == FastSync {
 					// If we've reached the allowed number of pending headers, stall a bit
-					for d.queue.PendingBlocks() >= maxQueuedHeaders || d.queue.PendingReceipts() >= maxQueuedHeaders {
+					for d.queue.PendingBodies() >= maxQueuedHeaders || d.queue.PendingReceipts() >= maxQueuedHeaders {
 						select {
 						case <-d.cancelCh:
 							rollbackErr = errCanceled
@@ -1833,16 +1575,6 @@ func (d *Downloader) commitPivotBlock(result *fetchResult) error {
 		d.stateBloom.Close()
 	}
 	return nil
-}
-
-// DeliverBodies injects a new batch of block bodies received from a remote node.
-func (d *Downloader) DeliverBodies(id string, transactions [][]*types.Transaction, uncles [][]*types.Header) error {
-	return d.deliver(d.bodyCh, &bodyPack{id, transactions, uncles}, bodyInMeter, bodyDropMeter)
-}
-
-// DeliverReceipts injects a new batch of receipts received from a remote node.
-func (d *Downloader) DeliverReceipts(id string, receipts [][]*types.Receipt) error {
-	return d.deliver(d.receiptCh, &receiptPack{id, receipts}, receiptInMeter, receiptDropMeter)
 }
 
 // DeliverNodeData injects a new batch of node state data received from a remote node.
