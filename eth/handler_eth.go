@@ -69,8 +69,8 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		return errors.New("old header handler still got called")
 
 	case *eth.BlockBodiesPacket:
-		txset, uncleset := packet.Unpack()
-		return h.handleBodies(peer, txset, uncleset)
+		log.Error("Old body handler still got called")
+		return errors.New("old body handler still got called")
 
 	case *eth.NodeDataPacket:
 		if err := h.downloader.DeliverNodeData(peer.ID(), *packet); err != nil {
@@ -79,10 +79,8 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 		return nil
 
 	case *eth.ReceiptsPacket:
-		if err := h.downloader.DeliverReceipts(peer.ID(), *packet); err != nil {
-			log.Debug("Failed to deliver receipts", "err", err)
-		}
-		return nil
+		log.Error("Old receipt handler still got called")
+		return errors.New("old receipt handler still got called")
 
 	case *eth.NewBlockHashesPacket:
 		hashes, numbers := packet.Unpack()
@@ -123,7 +121,7 @@ func (h *ethHandler) handleHeaders(peer *eth.Peer, headers []*types.Header) erro
 	}
 	return nil
 }
-*/
+
 // handleBodies is invoked from a peer's message handler when it transmits a batch
 // of block bodies for the local node to process.
 func (h *ethHandler) handleBodies(peer *eth.Peer, txs [][]*types.Transaction, uncles [][]*types.Header) error {
@@ -140,6 +138,7 @@ func (h *ethHandler) handleBodies(peer *eth.Peer, txs [][]*types.Transaction, un
 	}
 	return nil
 }
+*/
 
 // handleBlockAnnounces is invoked from a peer's message handler when it transmits a
 // batch of block announcements for the local node to process.

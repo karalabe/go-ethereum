@@ -19,6 +19,7 @@ package eth
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/p2p"
 )
@@ -37,16 +38,20 @@ var (
 	errMismatchingResponseType = errors.New("mismatching response type")
 )
 
-// Request is a pending request to allow tracking it and delilvering a response
+// Request is a pending request to allow tracking it and delivering a response
 // back to the requester on their chosen channel.
 type Request struct {
-	id     uint64         // Request ID to match up replies to
+	id   uint64    // Request ID to match up replies to
+	sent time.Time // Timestamp when the request was sent
+
 	sink   chan *Response // Channel to deliver the response on
 	cancel chan struct{}  // Channel to cancel requests ahead of time
 
 	code uint64      // Message code of the request packet
-	data interface{} // Data content of the request packet
 	want uint64      // Message code of the response packet
+	Data interface{} // Data content of the request packet
+
+	Peer string // Demultiplexer if cross-peer requests are batched together
 }
 
 // Close aborts an in-flight request. Although there's no way to notify the
@@ -67,12 +72,14 @@ type request struct {
 // on the channel assigned by the requester subsystem and contains the original
 // request embedded to allow uniquely matching it caller side.
 type Response struct {
-	id   uint64 // Request ID to match up this reply to
-	code uint64 // Response packet type to cross validate with request
+	id   uint64    // Request ID to match up this reply to
+	recv time.Time // Timestamp when the request was received
+	code uint64    // Response packet type to cross validate with request
 
-	Req  *Request    // Original request to cross reference with
-	Res  interface{} // Remote response for the request query
-	Done chan error  // Channel to signal message handling to the reader
+	Req  *Request      // Original request to cross-reference with
+	Res  interface{}   // Remote response for the request query
+	Time time.Duration // Time it took for the request to be served
+	Done chan error    // Channel to signal message handling to the reader
 }
 
 // response is a wrapper around a remote Response that has an error channel to
@@ -93,6 +100,7 @@ func (p *Peer) dispatchRequest(req *Request) error {
 		fail: make(chan error),
 	}
 	req.cancel = make(chan struct{})
+	req.Peer = p.id
 
 	select {
 	case p.reqDispatch <- reqOp:
@@ -109,6 +117,7 @@ func (p *Peer) dispatchResponse(res *Response) error {
 		res:  res,
 		fail: make(chan error),
 	}
+	res.recv = time.Now()
 	res.Done = make(chan error)
 
 	select {
@@ -117,7 +126,7 @@ func (p *Peer) dispatchResponse(res *Response) error {
 		if err := <-resOp.fail; err != nil {
 			return nil
 		}
-		// Wait until response is handler or request gets cancelled
+		// Wait until response is handled or request gets cancelled
 		select {
 		case err := <-res.Done:
 			return err // Response handled, return any errors
@@ -140,9 +149,10 @@ func (p *Peer) dispatchRequests() {
 		select {
 		case reqOp := <-p.reqDispatch:
 			req := reqOp.req
+			req.sent = time.Now()
 
 			requestTracker.Track(p.id, p.version, req.code, req.want, req.id)
-			err := p2p.Send(p.rw, req.code, req.data)
+			err := p2p.Send(p.rw, req.code, req.Data)
 			reqOp.fail <- err
 
 			if err == nil {
@@ -152,6 +162,7 @@ func (p *Peer) dispatchRequests() {
 		case resOp := <-p.resDispatch:
 			res := resOp.res
 			res.Req = pending[res.id]
+			res.Time = res.recv.Sub(res.Req.sent)
 
 			switch {
 			case res.Req == nil:

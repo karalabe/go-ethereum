@@ -78,7 +78,7 @@ type blockRetrievalFn func(common.Hash) *types.Block
 type headerRequesterFn func(common.Hash, chan *eth.Response) (*eth.Request, error)
 
 // bodyRequesterFn is a callback type for sending a body retrieval request.
-type bodyRequesterFn func([]common.Hash) error
+type bodyRequesterFn func([]common.Hash, chan *eth.Response) (*eth.Request, error)
 
 // headerVerifierFn is a callback type to verify a block's header for fast propagation.
 type headerVerifierFn func(header *types.Header) error
@@ -508,8 +508,23 @@ func (f *BlockFetcher) loop() {
 				if f.completingHook != nil {
 					f.completingHook(hashes)
 				}
+				fetchBodies := f.fetching[hashes[0]].fetchBodies
 				bodyFetchMeter.Mark(int64(len(hashes)))
-				go f.completing[hashes[0]].fetchBodies(hashes)
+
+				go func(peer string, hashes []common.Hash) {
+					resCh := make(chan *eth.Response)
+
+					req, err := fetchBodies(hashes, resCh)
+					if err != nil {
+						return // Legacy code, yolo
+					}
+					defer req.Close()
+
+					res := <-resCh
+
+					txs, uncles := res.Res.(*eth.BlockBodiesPacket).Unpack()
+					f.FilterBodies(peer, txs, uncles, time.Now())
+				}(peer, hashes)
 			}
 			// Schedule the next fetch if blocks are still pending
 			f.rescheduleComplete(completeTimer)

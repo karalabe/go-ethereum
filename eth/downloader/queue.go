@@ -54,8 +54,8 @@ var (
 // fetchRequest is a currently running data retrieval operation.
 type fetchRequest struct {
 	Peer    *peerConnection // Peer to which the request was sent
-	From    uint64          // [eth/62] Requested chain element index (used for skeleton fills only)
-	Headers []*types.Header // [eth/62] Requested headers, sorted by request order
+	From    uint64          // Requested chain element index (used for skeleton fills only)
+	Headers []*types.Header // Requested headers, sorted by request order
 	Time    time.Time       // Time when the request was made
 }
 
@@ -196,8 +196,8 @@ func (q *queue) PendingHeaders() int {
 	return q.headerTaskQueue.Size()
 }
 
-// PendingBlocks retrieves the number of block (body) requests pending for retrieval.
-func (q *queue) PendingBlocks() int {
+// PendingBodies retrieves the number of block body requests pending for retrieval.
+func (q *queue) PendingBodies() int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
@@ -210,15 +210,6 @@ func (q *queue) PendingReceipts() int {
 	defer q.lock.Unlock()
 
 	return q.receiptTaskQueue.Size()
-}
-
-// InFlightHeaders retrieves whether there are header fetch requests currently
-// in flight.
-func (q *queue) InFlightHeaders() bool {
-	q.lock.Lock()
-	defer q.lock.Unlock()
-
-	return len(q.headerPendPool) > 0
 }
 
 // InFlightBlocks retrieves whether there are block fetch requests currently in
@@ -566,6 +557,7 @@ func (q *queue) reserveHeaders(p *peerConnection, count int, taskPool map[common
 	return request, progress, throttled
 }
 
+/*
 // CancelHeaders aborts a fetch request, returning all pending skeleton indexes to the queue.
 func (q *queue) CancelHeaders(request *fetchRequest) {
 	q.lock.Lock()
@@ -598,7 +590,7 @@ func (q *queue) cancel(request *fetchRequest, taskQueue *prque.Prque, pendPool m
 		taskQueue.Push(header, -int64(header.Number.Uint64()))
 	}
 	delete(pendPool, request.Peer.id)
-}
+}*/
 
 // Revoke cancels all pending requests belonging to a given peer. This method is
 // meant to be called during a peer drop to quickly reassign owned data fetches
@@ -621,62 +613,60 @@ func (q *queue) Revoke(peerID string) {
 	}
 }
 
-// ExpireHeaders checks for in flight requests that exceeded a timeout allowance,
-// canceling them and returning the responsible peers for penalisation.
-func (q *queue) ExpireHeaders(timeout time.Duration) map[string]int {
+// ExpireHeaders cancels  a request that timed out and moves the pending fetch
+// task back into the queue for rescheduling.
+func (q *queue) ExpireHeaders(peer string) int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
-	return q.expire(timeout, q.headerPendPool, q.headerTaskQueue, headerTimeoutMeter)
+	headerTimeoutMeter.Mark(1)
+	return q.expire(peer, q.headerPendPool, q.headerTaskQueue)
 }
 
 // ExpireBodies checks for in flight block body requests that exceeded a timeout
 // allowance, canceling them and returning the responsible peers for penalisation.
-func (q *queue) ExpireBodies(timeout time.Duration) map[string]int {
+func (q *queue) ExpireBodies(peer string) int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
-	return q.expire(timeout, q.blockPendPool, q.blockTaskQueue, bodyTimeoutMeter)
+	bodyTimeoutMeter.Mark(1)
+	return q.expire(peer, q.blockPendPool, q.blockTaskQueue)
 }
 
 // ExpireReceipts checks for in flight receipt requests that exceeded a timeout
 // allowance, canceling them and returning the responsible peers for penalisation.
-func (q *queue) ExpireReceipts(timeout time.Duration) map[string]int {
+func (q *queue) ExpireReceipts(peer string) int {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
-	return q.expire(timeout, q.receiptPendPool, q.receiptTaskQueue, receiptTimeoutMeter)
+	receiptTimeoutMeter.Mark(1)
+	return q.expire(peer, q.receiptPendPool, q.receiptTaskQueue)
 }
 
-// expire is the generic check that move expired tasks from a pending pool back
-// into a task pool, returning all entities caught with expired tasks.
+// expire is the generic check that moves a specific expired task from a pending
+// pool back into a task pool.
 //
-// Note, this method expects the queue lock to be already held. The
-// reason the lock is not obtained in here is because the parameters already need
-// to access the queue, so they already need a lock anyway.
-func (q *queue) expire(timeout time.Duration, pendPool map[string]*fetchRequest, taskQueue *prque.Prque, timeoutMeter metrics.Meter) map[string]int {
-	// Iterate over the expired requests and return each to the queue
-	expiries := make(map[string]int)
-	for id, request := range pendPool {
-		if time.Since(request.Time) > timeout {
-			// Update the metrics with the timeout
-			timeoutMeter.Mark(1)
-
-			// Return any non satisfied requests to the pool
-			if request.From > 0 {
-				taskQueue.Push(request.From, -int64(request.From))
-			}
-			for _, header := range request.Headers {
-				taskQueue.Push(header, -int64(header.Number.Uint64()))
-			}
-			// Add the peer to the expiry report along the number of failed requests
-			expiries[id] = len(request.Headers)
-
-			// Remove the expired requests from the pending pool directly
-			delete(pendPool, id)
-		}
+// Note, this method expects the queue lock to be already held. The reason the
+// lock is not obtained in here is that the parameters already need to access
+// the queue, so they already need a lock anyway.
+func (q *queue) expire(peer string, pendPool map[string]*fetchRequest, taskQueue *prque.Prque) int {
+	// Retrieve the request being expired and log an error if it's non-existnet,
+	// as there's no order of events that should lead to such expirations.
+	req := pendPool[peer]
+	if req == nil {
+		log.Error("Expired request does not exist", "peer", peer)
+		return 0
 	}
-	return expiries
+	delete(pendPool, peer)
+
+	// Return any non-satisfied requests to the pool
+	if req.From > 0 {
+		taskQueue.Push(req.From, -int64(req.From))
+	}
+	for _, header := range req.Headers {
+		taskQueue.Push(header, -int64(header.Number.Uint64()))
+	}
+	return len(req.Headers)
 }
 
 // DeliverHeaders injects a header retrieval response into the header results

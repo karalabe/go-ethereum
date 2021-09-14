@@ -338,7 +338,7 @@ func (p *Peer) RequestOneHeader(hash common.Hash, sink chan *Response) (*Request
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		data: &GetBlockHeadersPacket66{
+		Data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Hash: hash},
@@ -365,7 +365,7 @@ func (p *Peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, re
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		data: &GetBlockHeadersPacket66{
+		Data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Hash: origin},
@@ -392,7 +392,7 @@ func (p *Peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		data: &GetBlockHeadersPacket66{
+		Data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Number: origin},
@@ -410,15 +410,24 @@ func (p *Peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 
 // RequestBodies fetches a batch of blocks' bodies corresponding to the hashes
 // specified.
-func (p *Peer) RequestBodies(hashes []common.Hash) error {
+func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Request, error) {
 	p.Log().Debug("Fetching batch of block bodies", "count", len(hashes))
 	id := rand.Uint64()
 
-	requestTracker.Track(p.id, p.version, GetBlockBodiesMsg, BlockBodiesMsg, id)
-	return p2p.Send(p.rw, GetBlockBodiesMsg, &GetBlockBodiesPacket66{
-		RequestId:            id,
-		GetBlockBodiesPacket: hashes,
-	})
+	req := &Request{
+		id:   id,
+		sink: sink,
+		code: GetBlockBodiesMsg,
+		want: BlockBodiesMsg,
+		Data: &GetBlockBodiesPacket66{
+			RequestId:            id,
+			GetBlockBodiesPacket: hashes,
+		},
+	}
+	if err := p.dispatchRequest(req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // RequestNodeData fetches a batch of arbitrary data from a node's known state
@@ -435,15 +444,24 @@ func (p *Peer) RequestNodeData(hashes []common.Hash) error {
 }
 
 // RequestReceipts fetches a batch of transaction receipts from a remote node.
-func (p *Peer) RequestReceipts(hashes []common.Hash) error {
+func (p *Peer) RequestReceipts(hashes []common.Hash, sink chan *Response) (*Request, error) {
 	p.Log().Debug("Fetching batch of receipts", "count", len(hashes))
 	id := rand.Uint64()
 
-	requestTracker.Track(p.id, p.version, GetReceiptsMsg, ReceiptsMsg, id)
-	return p2p.Send(p.rw, GetReceiptsMsg, &GetReceiptsPacket66{
-		RequestId:         id,
-		GetReceiptsPacket: hashes,
-	})
+	req := &Request{
+		id:   id,
+		sink: sink,
+		code: GetReceiptsMsg,
+		want: ReceiptsMsg,
+		Data: &GetReceiptsPacket66{
+			RequestId:         id,
+			GetReceiptsPacket: hashes,
+		},
+	}
+	if err := p.dispatchRequest(req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // RequestTxs fetches a batch of transactions from a remote node.
