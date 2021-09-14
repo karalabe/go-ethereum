@@ -95,11 +95,11 @@ func BenchmarkJumpdestOpAnalysis(bench *testing.B) {
 			codeBitmapInternal(code, bits)
 		}
 	}
-	op = STOP
-	bench.Run(op.String(), bencher)
 	for op = PUSH1; op <= PUSH32; op++ {
 		bench.Run(op.String(), bencher)
 	}
 	op = JUMPDEST
+	bench.Run(op.String(), bencher)
+	op = STOP
 	bench.Run(op.String(), bencher)
 }
