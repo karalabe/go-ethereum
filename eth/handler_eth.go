@@ -103,43 +103,6 @@ func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 	}
 }
 
-/*
-// handleHeaders is invoked from a peer's message handler when it transmits a batch
-// of headers for the local node to process.
-func (h *ethHandler) handleHeaders(peer *eth.Peer, headers []*types.Header) error {
-	// Filter out any explicitly requested headers, deliver the rest to the downloader
-	filter := len(headers) == 1
-	if filter {
-		// Irrelevant of the fork checks, send the header to the fetcher just in case
-		headers = h.blockFetcher.FilterHeaders(peer.ID(), headers, time.Now())
-	}
-	if len(headers) > 0 || !filter {
-		err := h.downloader.DeliverHeaders(peer.ID(), headers)
-		if err != nil {
-			log.Debug("Failed to deliver headers", "err", err)
-		}
-	}
-	return nil
-}
-
-// handleBodies is invoked from a peer's message handler when it transmits a batch
-// of block bodies for the local node to process.
-func (h *ethHandler) handleBodies(peer *eth.Peer, txs [][]*types.Transaction, uncles [][]*types.Header) error {
-	// Filter out any explicitly requested bodies, deliver the rest to the downloader
-	filter := len(txs) > 0 || len(uncles) > 0
-	if filter {
-		txs, uncles = h.blockFetcher.FilterBodies(peer.ID(), txs, uncles, time.Now())
-	}
-	if len(txs) > 0 || len(uncles) > 0 || !filter {
-		err := h.downloader.DeliverBodies(peer.ID(), txs, uncles)
-		if err != nil {
-			log.Debug("Failed to deliver bodies", "err", err)
-		}
-	}
-	return nil
-}
-*/
-
 // handleBlockAnnounces is invoked from a peer's message handler when it transmits a
 // batch of block announcements for the local node to process.
 func (h *ethHandler) handleBlockAnnounces(peer *eth.Peer, hashes []common.Hash, numbers []uint64) error {
