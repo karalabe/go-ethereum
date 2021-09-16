@@ -432,15 +432,24 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 
 // RequestNodeData fetches a batch of arbitrary data from a node's known state
 // data, corresponding to the specified hashes.
-func (p *Peer) RequestNodeData(hashes []common.Hash) error {
+func (p *Peer) RequestNodeData(hashes []common.Hash, sink chan *Response) (*Request, error) {
 	p.Log().Debug("Fetching batch of state data", "count", len(hashes))
 	id := rand.Uint64()
 
-	requestTracker.Track(p.id, p.version, GetNodeDataMsg, NodeDataMsg, id)
-	return p2p.Send(p.rw, GetNodeDataMsg, &GetNodeDataPacket66{
-		RequestId:         id,
-		GetNodeDataPacket: hashes,
-	})
+	req := &Request{
+		id:   id,
+		sink: sink,
+		code: GetNodeDataMsg,
+		want: NodeDataMsg,
+		Data: &GetNodeDataPacket66{
+			RequestId:         id,
+			GetNodeDataPacket: hashes,
+		},
+	}
+	if err := p.dispatchRequest(req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 // RequestReceipts fetches a batch of transaction receipts from a remote node.

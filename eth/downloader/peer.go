@@ -22,9 +22,7 @@ package downloader
 import (
 	"errors"
 	"math/big"
-	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -48,9 +46,6 @@ var (
 type peerConnection struct {
 	id string // Unique identifier of the peer
 
-	stateIdle    int32     // Current node data activity state of the peer (idle = 0, active = 1)
-	stateStarted time.Time // Time instance when the last node data fetch was started
-
 	rates   *msgrate.Tracker         // Tracker to hone in on the number of items retrievable per second
 	lacking map[common.Hash]struct{} // Set of hashes not to request (didn't have previously)
 
@@ -73,7 +68,6 @@ type Peer interface {
 	LightPeer
 	RequestBodies([]common.Hash, chan *eth.Response) (*eth.Request, error)
 	RequestReceipts([]common.Hash, chan *eth.Response) (*eth.Request, error)
-	RequestNodeData([]common.Hash) error
 }
 
 // lightPeerWrapper wraps a LightPeer struct, stubbing out the Peer-only methods.
@@ -94,9 +88,6 @@ func (w *lightPeerWrapper) RequestBodies([]common.Hash, chan *eth.Response) (*et
 func (w *lightPeerWrapper) RequestReceipts([]common.Hash, chan *eth.Response) (*eth.Request, error) {
 	panic("RequestReceipts not supported in light client mode sync")
 }
-func (w *lightPeerWrapper) RequestNodeData([]common.Hash) error {
-	panic("RequestNodeData not supported in light client mode sync")
-}
 
 // newPeerConnection creates a new downloader peer.
 func newPeerConnection(id string, version uint, peer Peer, logger log.Logger) *peerConnection {
@@ -114,22 +105,7 @@ func (p *peerConnection) Reset() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	atomic.StoreInt32(&p.stateIdle, 0)
-
 	p.lacking = make(map[common.Hash]struct{})
-}
-
-// FetchNodeData sends a node state data retrieval request to the remote peer.
-func (p *peerConnection) FetchNodeData(hashes []common.Hash) error {
-	// Short circuit if the peer is already fetching
-	if !atomic.CompareAndSwapInt32(&p.stateIdle, 0, 1) {
-		return errAlreadyFetching
-	}
-	p.stateStarted = time.Now()
-
-	go p.peer.RequestNodeData(hashes)
-
-	return nil
 }
 
 // UpdateHeaderRate updates the peer's estimated header retrieval throughput with
@@ -148,14 +124,6 @@ func (p *peerConnection) UpdateBodyRate(delivered int, elapsed time.Duration) {
 // with the current measurement.
 func (p *peerConnection) UpdateReceiptRate(delivered int, elapsed time.Duration) {
 	p.rates.Update(eth.ReceiptsMsg, elapsed, delivered)
-}
-
-// SetNodeDataIdle sets the peer to idle, allowing it to execute new state trie
-// data retrieval requests. Its estimated state retrieval throughput is updated
-// with that measured just now.
-func (p *peerConnection) SetNodeDataIdle(delivered int, deliveryTime time.Time) {
-	p.rates.Update(eth.NodeDataMsg, deliveryTime.Sub(p.stateStarted), delivered)
-	atomic.StoreInt32(&p.stateIdle, 0)
 }
 
 // HeaderCapacity retrieves the peer's header download allowance based on its
@@ -184,16 +152,6 @@ func (p *peerConnection) ReceiptCapacity(targetRTT time.Duration) int {
 	cap := p.rates.Capacity(eth.ReceiptsMsg, targetRTT)
 	if cap > MaxReceiptFetch {
 		cap = MaxReceiptFetch
-	}
-	return cap
-}
-
-// NodeDataCapacity retrieves the peers state download allowance based on its
-// previously discovered throughput.
-func (p *peerConnection) NodeDataCapacity(targetRTT time.Duration) int {
-	cap := p.rates.Capacity(eth.NodeDataMsg, targetRTT)
-	if cap > MaxStateFetch {
-		cap = MaxStateFetch
 	}
 	return cap
 }
@@ -332,46 +290,6 @@ func (ps *peerSet) AllPeers() []*peerConnection {
 		list = append(list, p)
 	}
 	return list
-}
-
-// NodeDataIdlePeers retrieves a flat list of all the currently node-data-idle
-// peers within the active peer set, ordered by their reputation.
-func (ps *peerSet) NodeDataIdlePeers() ([]*peerConnection, int) {
-	idle := func(p *peerConnection) bool {
-		return atomic.LoadInt32(&p.stateIdle) == 0
-	}
-	throughput := func(p *peerConnection) int {
-		return p.rates.Capacity(eth.NodeDataMsg, time.Second)
-	}
-	return ps.idlePeers(eth.ETH66, eth.ETH66, idle, throughput)
-}
-
-// idlePeers retrieves a flat list of all currently idle peers satisfying the
-// protocol version constraints, using the provided function to check idleness.
-// The resulting set of peers are sorted by their capacity.
-func (ps *peerSet) idlePeers(minProtocol, maxProtocol uint, idleCheck func(*peerConnection) bool, capacity func(*peerConnection) int) ([]*peerConnection, int) {
-	ps.lock.RLock()
-	defer ps.lock.RUnlock()
-
-	var (
-		total = 0
-		idle  = make([]*peerConnection, 0, len(ps.peers))
-		tps   = make([]int, 0, len(ps.peers))
-	)
-	for _, p := range ps.peers {
-		if p.version >= minProtocol && p.version <= maxProtocol {
-			if idleCheck(p) {
-				idle = append(idle, p)
-				tps = append(tps, capacity(p))
-			}
-			total++
-		}
-	}
-
-	// And sort them
-	sortPeers := &peerCapacitySort{idle, tps}
-	sort.Sort(sortPeers)
-	return sortPeers.p, total
 }
 
 // peerCapacitySort implements sort.Interface.

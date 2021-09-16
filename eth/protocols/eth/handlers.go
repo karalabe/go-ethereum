@@ -303,9 +303,11 @@ func handleNodeData66(backend Backend, msg Decoder, peer *Peer) error {
 	if err := msg.Decode(res); err != nil {
 		return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 	}
-	requestTracker.Fulfil(peer.id, peer.version, NodeDataMsg, res.RequestId)
-
-	return backend.Handle(peer, &res.NodeDataPacket)
+	return peer.dispatchResponse(&Response{
+		id:   res.RequestId,
+		code: NodeDataMsg,
+		Res:  &res.NodeDataPacket,
+	})
 }
 
 func handleReceipts66(backend Backend, msg Decoder, peer *Peer) error {
