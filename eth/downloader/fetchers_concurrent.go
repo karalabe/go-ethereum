@@ -18,7 +18,6 @@ package downloader
 
 import (
 	"errors"
-	"fmt"
 	"sort"
 	"time"
 
@@ -138,9 +137,7 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 				// Reserve a chunk of fetches for a peer. A nil can mean either that
 				// no more headers are available, or that the peer is known not to
 				// have them.
-				rtt := d.peers.rates.TargetRoundTrip()
-
-				request, progress, throttle := queue.reserve(peer, queue.capacity(peer, rtt))
+				request, progress, throttle := queue.reserve(peer, queue.capacity(peer, d.peers.rates.TargetRoundTrip()))
 				if progress {
 					progressed = true
 				}
@@ -154,18 +151,22 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 				// Fetch the chunk and make sure any errors return the hashes to the queue
 				req, err := queue.request(peer, request, responses)
 				if err != nil {
-					// Although we could try and make an attempt to fix this, this error really
-					// means that we've double allocated a fetch task to a peer. If that is the
-					// case, the internal states of the downloader and the queue are very wrong so
-					// better hard crash and note the error instead of silently accumulating into
-					// a much bigger issue.
-					panic(fmt.Sprintf("%v: fetch assignment failed", peer))
+					// Sending the request failed, which generally means the peer
+					// was diconnected in between assignment and network send.
+					// Although all peer removal operations return allocated tasks
+					// to the queue, that is async, and we can do better here by
+					// immediately pushing the unfulfilled requests.
+					queue.unreserve(peer.id) // TODO(karalabe): This needs a non-expiration method
+					continue
 				}
 				requests[peer.id] = req
+
+				ttl := d.peers.rates.TargetTimeout()
 				ordering[req] = timeouts.Size()
-				timeouts.Push(req, int64(rtt))
+
+				timeouts.Push(req, -time.Now().Add(ttl).UnixNano())
 				if timeouts.Size() == 1 {
-					timeout.Reset(rtt)
+					timeout.Reset(ttl)
 				}
 			}
 			// Make sure that we have peers available for fetching. If all peers have been tried
@@ -188,8 +189,8 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 			// code, there's no possible order of events that should result in a
 			// timeout firing for a non-existent event.
 			item, exp := timeouts.Peek()
-			if now, at := time.Now(), time.Unix(0, exp); now.Before(at) {
-				log.Error("Timeout triggered but not reached", "now", now, "timeout", at)
+			if now, at := time.Now(), time.Unix(0, -exp); now.Before(at) {
+				log.Error("Timeout triggered but not reached", "left", at.Sub(now))
 				timeout.Reset(at.Sub(now))
 				continue
 			}
@@ -203,7 +204,7 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 			timeouts.Pop()
 			if timeouts.Size() > 0 {
 				_, exp := timeouts.Peek()
-				timeout.Reset(time.Until(time.Unix(0, exp)))
+				timeout.Reset(time.Until(time.Unix(0, -exp)))
 			}
 			// New timeout potentially set if there are more requests pending,
 			// reschedule the failed one to a free peer
@@ -257,7 +258,7 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 					}
 					if timeouts.Size() > 0 {
 						_, exp := timeouts.Peek()
-						timeout.Reset(time.Until(time.Unix(0, exp)))
+						timeout.Reset(time.Until(time.Unix(0, -exp)))
 					}
 				}
 			}

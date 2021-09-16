@@ -126,10 +126,10 @@ func (p *Peer) dispatchResponse(res *Response) error {
 		if err := <-resOp.fail; err != nil {
 			return nil
 		}
-		// Wait until response is handled or request gets cancelled
+		// Deliver the filled out response and wait until it's handled
 		select {
-		case err := <-res.Done:
-			return err // Response handled, return any errors
+		case res.Req.sink <- res:
+			return <-res.Done // Response delivered, return any errors
 		case <-res.Req.cancel:
 			return nil // Request cancelled, silently discard response
 		}
@@ -184,10 +184,9 @@ func (p *Peer) dispatchRequests() {
 				// it can wait for a handler response and dispatch the data.
 				resOp.fail <- nil
 
-				// Deliver the response to the requester for handling
+				// Stop tracking the request, the response dispatcher will deliver
 				requestTracker.Fulfil(p.id, p.version, res.code, res.id)
 				delete(pending, res.id)
-				res.Req.sink <- res
 			}
 
 		case <-p.term:
