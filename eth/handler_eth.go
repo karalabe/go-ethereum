@@ -64,21 +64,19 @@ func (h *ethHandler) AcceptTxs() bool {
 func (h *ethHandler) Handle(peer *eth.Peer, packet eth.Packet) error {
 	// Consume any broadcasts and announces, forwarding the rest to the downloader
 	switch packet := packet.(type) {
-	case *eth.BlockHeadersPacket:
+	case *eth.BlockHeadersPacket: //  TODO(karalabe): Delete before PR merge
 		log.Error("Old header handler still got called")
 		return errors.New("old header handler still got called")
 
-	case *eth.BlockBodiesPacket:
+	case *eth.BlockBodiesPacket: //  TODO(karalabe): Delete before PR merge
 		log.Error("Old body handler still got called")
 		return errors.New("old body handler still got called")
 
-	case *eth.NodeDataPacket:
-		if err := h.downloader.DeliverNodeData(peer.ID(), *packet); err != nil {
-			log.Debug("Failed to deliver node state data", "err", err)
-		}
-		return nil
+	case *eth.NodeDataPacket: //  TODO(karalabe): Delete before PR merge
+		log.Error("Old node data handler still got called")
+		return errors.New("old node data handler still got called")
 
-	case *eth.ReceiptsPacket:
+	case *eth.ReceiptsPacket: //  TODO(karalabe): Delete before PR merge
 		log.Error("Old receipt handler still got called")
 		return errors.New("old receipt handler still got called")
 
