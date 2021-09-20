@@ -127,10 +127,12 @@ type queue struct {
 	blockTaskPool  map[common.Hash]*types.Header // Pending block (body) retrieval tasks, mapping hashes to headers
 	blockTaskQueue *prque.Prque                  // Priority queue of the headers to fetch the blocks (bodies) for
 	blockPendPool  map[string]*fetchRequest      // Currently pending block (body) retrieval operations
+	blockWakeCh    chan bool                     // Channel to notify the block fetcher of new tasks
 
 	receiptTaskPool  map[common.Hash]*types.Header // Pending receipt retrieval tasks, mapping hashes to headers
 	receiptTaskQueue *prque.Prque                  // Priority queue of the headers to fetch the receipts for
 	receiptPendPool  map[string]*fetchRequest      // Currently pending receipt retrieval operations
+	receiptWakeCh    chan bool                     // Channel to notify when receipt fetcher of new tasks
 
 	resultCache *resultStore       // Downloaded but not yet delivered fetch results
 	resultSize  common.StorageSize // Approximate size of a block (exponential moving average)
@@ -146,9 +148,11 @@ type queue struct {
 func newQueue(blockCacheLimit int, thresholdInitialSize int) *queue {
 	lock := new(sync.RWMutex)
 	q := &queue{
-		headerContCh:     make(chan bool),
+		headerContCh:     make(chan bool, 1),
 		blockTaskQueue:   prque.New(nil),
+		blockWakeCh:      make(chan bool, 1),
 		receiptTaskQueue: prque.New(nil),
+		receiptWakeCh:    make(chan bool, 1),
 		active:           sync.NewCond(lock),
 		lock:             lock,
 	}
@@ -374,6 +378,13 @@ func (q *queue) Results(block bool) []*fetchResult {
 	throttleThreshold := uint64((common.StorageSize(blockCacheMemory) + q.resultSize - 1) / q.resultSize)
 	throttleThreshold = q.resultCache.SetThrottleThreshold(throttleThreshold)
 
+	// With results removed from the cache, wake throttled fetchers
+	for _, ch := range []chan bool{q.blockWakeCh, q.receiptWakeCh} {
+		select {
+		case ch <- true:
+		default:
+		}
+	}
 	// Log some info at certain times
 	if time.Since(q.lastStatLog) > 60*time.Second {
 		q.lastStatLog = time.Now()
