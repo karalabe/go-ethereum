@@ -67,8 +67,8 @@ type typedQueue interface {
 }
 
 // concurrentFetch iteratively downloads scheduled block parts, taking available
-// peers, reserving a chunk of fetch requests for each, waiting for delivery and
-// also periodically checking for timeouts.
+// peers, reserving a chunk of fetch requests for each and waiting for delivery
+// or timeouts.
 func (d *Downloader) concurrentFetch(queue typedQueue) error {
 	// Create a delivery channel to accept responses from all peers
 	responses := make(chan *eth.Response)
@@ -93,6 +93,18 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 		<-timeout.C
 	}
 	defer timeout.Stop()
+
+	// Subscribe to peer lifecycle events to schedule tasks to new joiners and
+	// reschedule tasks upon disconnections. We don't care which event happened
+	// for simplicity, so just use a single channel.
+	peering := make(chan *peerConnection, 64) // arbitrary buffer, just some burst protection
+	leaving := make(chan *peerConnection, 64) // arbitrary buffer, just some burst protection
+
+	addPeerSub := d.peers.SubscribeNewPeers(peering)
+	defer addPeerSub.Unsubscribe()
+
+	remPeerSub := d.peers.SubscribePeerDrops(leaving)
+	defer remPeerSub.Unsubscribe()
 
 	// Prepare the queue and fetch block parts until the block header fetcher's done
 	finished := false
@@ -183,6 +195,33 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 			// be dropped when they arrive
 			return errCanceled
 
+		case <-peering:
+			// A peer joined, the tasks queue and allocations need to be checked
+			// for potential assignment
+			continue
+
+		case peer := <-leaving:
+			// A peer left, any existing requests need to be untracked, pending
+			// tasks returned and possible reassignment checkde
+			if req, ok := requests[peer.id]; ok {
+				queue.unreserve(peer.id) // TODO(karalabe): This needs a non-expiration method
+				delete(requests, peer.id)
+				if index, live := ordering[req]; live {
+					timeouts.Remove(index)
+					if index == 0 {
+						if !timeout.Stop() {
+							<-timeout.C
+						}
+						if timeouts.Size() > 0 {
+							_, exp := timeouts.Peek()
+							timeout.Reset(time.Until(time.Unix(0, -exp)))
+						}
+					}
+					delete(ordering, req)
+				}
+			}
+			continue
+
 		case <-timeout.C:
 			// Retrieve the next request which should have timed out. The check
 			// below is purely for to catch programming errors, given the correct
@@ -261,6 +300,7 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 						timeout.Reset(time.Until(time.Unix(0, -exp)))
 					}
 				}
+				delete(ordering, res.Req)
 			}
 			if _, ok := requests[res.Req.Peer]; ok {
 				delete(requests, res.Req.Peer)

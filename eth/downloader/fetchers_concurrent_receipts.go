@@ -31,7 +31,7 @@ type receiptQueue Downloader
 // waker returns a notification channel that gets pinged in case more reecipt
 // fetches have been queued up, so the fetcher might assign it to idle peers.
 func (q *receiptQueue) waker() chan bool {
-	return q.receiptWakeCh
+	return q.queue.receiptWakeCh
 }
 
 // pending returns the number of receipt that are currently queued for fetching
@@ -95,7 +95,7 @@ func (q *receiptQueue) deliver(peer *peerConnection, packet *eth.Response) (int,
 	case err == nil && len(receipts) == 0:
 		peer.log.Trace("Requested receipts delivered")
 	case err == nil:
-		peer.log.Trace("Delivered new batch of receipts", "count", len(receipts))
+		peer.log.Trace("Delivered new batch of receipts", "count", len(receipts), "accepted", accepted)
 	default:
 		peer.log.Debug("Failed to deliver retrieved receipts", "err", err)
 	}

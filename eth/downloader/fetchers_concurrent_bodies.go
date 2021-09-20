@@ -31,7 +31,7 @@ type bodyQueue Downloader
 // waker returns a notification channel that gets pinged in case more body
 // fetches have been queued up, so the fetcher might assign it to idle peers.
 func (q *bodyQueue) waker() chan bool {
-	return q.bodyWakeCh
+	return q.queue.blockWakeCh
 }
 
 // pending returns the number of bodies that are currently queued for fetching
@@ -96,7 +96,7 @@ func (q *bodyQueue) deliver(peer *peerConnection, packet *eth.Response) (int, er
 	case err == nil && len(txs) == 0:
 		peer.log.Trace("Requested bodies delivered")
 	case err == nil:
-		peer.log.Trace("Delivered new batch of bodies", "count", len(txs))
+		peer.log.Trace("Delivered new batch of bodies", "count", len(txs), "accepted", accepted)
 	default:
 		peer.log.Debug("Failed to deliver retrieved bodies", "err", err)
 	}
