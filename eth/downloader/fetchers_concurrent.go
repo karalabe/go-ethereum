@@ -97,14 +97,10 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 	// Subscribe to peer lifecycle events to schedule tasks to new joiners and
 	// reschedule tasks upon disconnections. We don't care which event happened
 	// for simplicity, so just use a single channel.
-	peering := make(chan *peerConnection, 64) // arbitrary buffer, just some burst protection
-	leaving := make(chan *peerConnection, 64) // arbitrary buffer, just some burst protection
+	peering := make(chan *peeringEvent, 64) // arbitrary buffer, just some burst protection
 
-	addPeerSub := d.peers.SubscribeNewPeers(peering)
-	defer addPeerSub.Unsubscribe()
-
-	remPeerSub := d.peers.SubscribePeerDrops(leaving)
-	defer remPeerSub.Unsubscribe()
+	peeringSub := d.peers.SubscribeEvents(peering)
+	defer peeringSub.Unsubscribe()
 
 	// Prepare the queue and fetch block parts until the block header fetcher's done
 	finished := false
@@ -195,17 +191,26 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 			// be dropped when they arrive
 			return errCanceled
 
-		case <-peering:
-			// A peer joined, the tasks queue and allocations need to be checked
-			// for potential assignment
-			continue
+		case event := <-peering:
+			// A peer joined or left, the tasks queue and allocations need to be
+			// checked for potential assignment or reassignment
+			peerid := event.peer.id
 
-		case peer := <-leaving:
+			if event.join {
+				// Sanity check the internal state; this can be dropped later
+				if _, ok := requests[peerid]; ok {
+					event.peer.log.Error("Pending request exists for joining peer")
+				}
+				// Loop back to the entry point for task assignment
+				continue
+			}
 			// A peer left, any existing requests need to be untracked, pending
-			// tasks returned and possible reassignment checkde
-			if req, ok := requests[peer.id]; ok {
-				queue.unreserve(peer.id) // TODO(karalabe): This needs a non-expiration method
-				delete(requests, peer.id)
+			// tasks returned and possible reassignment checked
+			if req, ok := requests[peerid]; ok {
+				queue.unreserve(peerid) // TODO(karalabe): This needs a non-expiration method
+				delete(requests, peerid)
+				req.Close()
+
 				if index, live := ordering[req]; live {
 					timeouts.Remove(index)
 					if index == 0 {
@@ -220,7 +225,6 @@ func (d *Downloader) concurrentFetch(queue typedQueue) error {
 					delete(ordering, req)
 				}
 			}
-			continue
 
 		case <-timeout.C:
 			// Retrieve the next request which should have timed out. The check

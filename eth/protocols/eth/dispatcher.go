@@ -49,7 +49,7 @@ type Request struct {
 
 	code uint64      // Message code of the request packet
 	want uint64      // Message code of the response packet
-	Data interface{} // Data content of the request packet
+	data interface{} // Data content of the request packet
 
 	Peer string // Demultiplexer if cross-peer requests are batched together
 }
@@ -58,7 +58,9 @@ type Request struct {
 // remote peer about the cancellation, this method notifies the dispatcher to
 // discard any late responses.
 func (r *Request) Close() {
-	close(r.cancel)
+	if r.cancel != nil { // Nil only in external packet tests
+		close(r.cancel)
+	}
 }
 
 // request is a wrapper around a client Request that has an error channel to
@@ -152,7 +154,7 @@ func (p *Peer) dispatchRequests() {
 			req.sent = time.Now()
 
 			requestTracker.Track(p.id, p.version, req.code, req.want, req.id)
-			err := p2p.Send(p.rw, req.code, req.Data)
+			err := p2p.Send(p.rw, req.code, req.data)
 			reqOp.fail <- err
 
 			if err == nil {

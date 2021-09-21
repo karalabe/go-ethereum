@@ -338,7 +338,7 @@ func (p *Peer) RequestOneHeader(hash common.Hash, sink chan *Response) (*Request
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		Data: &GetBlockHeadersPacket66{
+		data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Hash: hash},
@@ -365,7 +365,7 @@ func (p *Peer) RequestHeadersByHash(origin common.Hash, amount int, skip int, re
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		Data: &GetBlockHeadersPacket66{
+		data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Hash: origin},
@@ -392,7 +392,7 @@ func (p *Peer) RequestHeadersByNumber(origin uint64, amount int, skip int, rever
 		sink: sink,
 		code: GetBlockHeadersMsg,
 		want: BlockHeadersMsg,
-		Data: &GetBlockHeadersPacket66{
+		data: &GetBlockHeadersPacket66{
 			RequestId: id,
 			GetBlockHeadersPacket: &GetBlockHeadersPacket{
 				Origin:  HashOrNumber{Number: origin},
@@ -419,7 +419,7 @@ func (p *Peer) RequestBodies(hashes []common.Hash, sink chan *Response) (*Reques
 		sink: sink,
 		code: GetBlockBodiesMsg,
 		want: BlockBodiesMsg,
-		Data: &GetBlockBodiesPacket66{
+		data: &GetBlockBodiesPacket66{
 			RequestId:            id,
 			GetBlockBodiesPacket: hashes,
 		},
@@ -441,7 +441,7 @@ func (p *Peer) RequestNodeData(hashes []common.Hash, sink chan *Response) (*Requ
 		sink: sink,
 		code: GetNodeDataMsg,
 		want: NodeDataMsg,
-		Data: &GetNodeDataPacket66{
+		data: &GetNodeDataPacket66{
 			RequestId:         id,
 			GetNodeDataPacket: hashes,
 		},
@@ -462,7 +462,7 @@ func (p *Peer) RequestReceipts(hashes []common.Hash, sink chan *Response) (*Requ
 		sink: sink,
 		code: GetReceiptsMsg,
 		want: ReceiptsMsg,
-		Data: &GetReceiptsPacket66{
+		data: &GetReceiptsPacket66{
 			RequestId:         id,
 			GetReceiptsPacket: hashes,
 		},
