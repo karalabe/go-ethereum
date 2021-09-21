@@ -63,11 +63,6 @@ func (d *Downloader) runStateSync(s *stateSync) *stateSync {
 	go s.run()
 	defer s.Cancel()
 
-	// Listen for peer departure events to cancel assigned tasks
-	peerDrop := make(chan *peerConnection, 1024)
-	peerSub := s.d.peers.SubscribePeerDrops(peerDrop)
-	defer peerSub.Unsubscribe()
-
 	for {
 		select {
 		case next := <-d.stateSyncStart:

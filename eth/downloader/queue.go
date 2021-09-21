@@ -575,6 +575,10 @@ func (q *queue) Revoke(peerID string) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
+	if request, ok := q.headerPendPool[peerID]; ok {
+		q.headerTaskQueue.Push(request.From, -int64(request.From))
+		delete(q.headerPendPool, peerID)
+	}
 	if request, ok := q.blockPendPool[peerID]; ok {
 		for _, header := range request.Headers {
 			q.blockTaskQueue.Push(header, -int64(header.Number.Uint64()))
@@ -589,7 +593,7 @@ func (q *queue) Revoke(peerID string) {
 	}
 }
 
-// ExpireHeaders cancels  a request that timed out and moves the pending fetch
+// ExpireHeaders cancels a request that timed out and moves the pending fetch
 // task back into the queue for rescheduling.
 func (q *queue) ExpireHeaders(peer string) int {
 	q.lock.Lock()
@@ -650,7 +654,7 @@ func (q *queue) expire(peer string, pendPool map[string]*fetchRequest, taskQueue
 // if they do not map correctly to the skeleton.
 //
 // If the headers are accepted, the method makes an attempt to deliver the set
-// of ready headers to the processor to keep the pipeline full. However it will
+// of ready headers to the processor to keep the pipeline full. However, it will
 // not block to prevent stalling other pending deliveries.
 func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh chan []*types.Header) (int, error) {
 	q.lock.Lock()

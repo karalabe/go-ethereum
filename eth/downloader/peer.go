@@ -182,14 +182,19 @@ func (p *peerConnection) Lacks(hash common.Hash) bool {
 	return ok
 }
 
+// peeringEvent is sent on the peer event feed when a remote peer connects or
+// disconnects.
+type peeringEvent struct {
+	peer *peerConnection
+	join bool
+}
+
 // peerSet represents the collection of active peer participating in the chain
 // download procedure.
 type peerSet struct {
-	peers map[string]*peerConnection
-	rates *msgrate.Trackers // Set of rate trackers to give the sync a common beat
-
-	newPeerFeed  event.Feed
-	peerDropFeed event.Feed
+	peers  map[string]*peerConnection
+	rates  *msgrate.Trackers // Set of rate trackers to give the sync a common beat
+	events event.Feed        // Feed to publish peer lifecycle events on
 
 	lock sync.RWMutex
 }
@@ -202,14 +207,9 @@ func newPeerSet() *peerSet {
 	}
 }
 
-// SubscribeNewPeers subscribes to peer arrival events.
-func (ps *peerSet) SubscribeNewPeers(ch chan<- *peerConnection) event.Subscription {
-	return ps.newPeerFeed.Subscribe(ch)
-}
-
-// SubscribePeerDrops subscribes to peer departure events.
-func (ps *peerSet) SubscribePeerDrops(ch chan<- *peerConnection) event.Subscription {
-	return ps.peerDropFeed.Subscribe(ch)
+// SubscribeEvents subscribes to peer arrival and departure events.
+func (ps *peerSet) SubscribeEvents(ch chan<- *peeringEvent) event.Subscription {
+	return ps.events.Subscribe(ch)
 }
 
 // Reset iterates over the current peer set, and resets each of the known peers
@@ -243,7 +243,7 @@ func (ps *peerSet) Register(p *peerConnection) error {
 	ps.peers[p.id] = p
 	ps.lock.Unlock()
 
-	ps.newPeerFeed.Send(p)
+	ps.events.Send(&peeringEvent{peer: p, join: true})
 	return nil
 }
 
@@ -260,7 +260,7 @@ func (ps *peerSet) Unregister(id string) error {
 	ps.rates.Untrack(id)
 	ps.lock.Unlock()
 
-	ps.peerDropFeed.Send(p)
+	ps.events.Send(&peeringEvent{peer: p, join: false})
 	return nil
 }
 
