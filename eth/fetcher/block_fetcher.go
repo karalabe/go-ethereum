@@ -478,7 +478,9 @@ func (f *BlockFetcher) loop() {
 							defer req.Close()
 
 							res := <-resCh
-							f.FilterHeaders(peer, *res.Res.(*eth.BlockHeadersPacket), time.Now())
+							res.Done <- nil
+
+							f.FilterHeaders(peer, *res.Res.(*eth.BlockHeadersPacket), time.Now().Add(res.Time))
 						}()
 					}
 				}(peer)
@@ -509,7 +511,7 @@ func (f *BlockFetcher) loop() {
 				if f.completingHook != nil {
 					f.completingHook(hashes)
 				}
-				fetchBodies := f.fetching[hashes[0]].fetchBodies
+				fetchBodies := f.completing[hashes[0]].fetchBodies
 				bodyFetchMeter.Mark(int64(len(hashes)))
 
 				go func(peer string, hashes []common.Hash) {
@@ -522,6 +524,7 @@ func (f *BlockFetcher) loop() {
 					defer req.Close()
 
 					res := <-resCh
+					res.Done <- nil
 
 					txs, uncles := res.Res.(*eth.BlockBodiesPacket).Unpack()
 					f.FilterBodies(peer, txs, uncles, time.Now())
