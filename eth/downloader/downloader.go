@@ -116,6 +116,9 @@ type Downloader struct {
 	// Channels
 	headerProcCh chan []*types.Header // Channel to feed the header processor new tasks
 
+	// Skeleton sync
+	skeleton *skeleton // Header skeleton to backfill the chain with (eth2 mode)
+
 	// State sync
 	pivotHeader *types.Header // Pivot block header to dynamically push the syncing state root
 	pivotLock   sync.RWMutex  // Lock protecting pivot header reads from updates
@@ -213,6 +216,8 @@ func New(checkpoint uint64, stateDb ethdb.Database, stateBloom *trie.SyncBloom, 
 		SnapSyncer:     snap.NewSyncer(stateDb),
 		stateSyncStart: make(chan *stateSync),
 	}
+	dl.skeleton = newSkeleton(stateDb, dl.peers, dropPeer)
+
 	go dl.stateFetcher()
 	return dl
 }
@@ -441,6 +446,9 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	if err != nil {
 		return err
 	}
+	// TODO(karalabe): Hack in test reverse mode
+	d.skeleton.Sync(latest)
+
 	if mode == SnapSync && pivot == nil {
 		// If no pivot block was returned, the head is below the min full block
 		// threshold (i.e. new chain). In that case we won't really fast sync
