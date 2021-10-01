@@ -30,7 +30,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -407,11 +406,14 @@ func (d *Downloader) synchronise(id string, hash common.Hash, td *big.Int, mode 
 	atomic.StoreUint32(&d.mode, uint32(mode))
 
 	// Retrieve the origin peer and initiate the downloading process
-	p := d.peers.Peer(id)
-	if p == nil {
-		return errUnknownPeer
+	var p *peerConnection
+	if !beaconMode { // Beacon mode doesn't need a peer to sync from
+		p = d.peers.Peer(id)
+		if p == nil {
+			return errUnknownPeer
+		}
 	}
-	return d.syncWithPeer(p, hash, td)
+	return d.syncWithPeer(p, hash, td, beaconMode)
 }
 
 func (d *Downloader) getMode() SyncMode {
@@ -420,7 +422,7 @@ func (d *Downloader) getMode() SyncMode {
 
 // syncWithPeer starts a block synchronization based on the hash chain from the
 // specified peer and head hash.
-func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.Int) (err error) {
+func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.Int, beaconMode bool) (err error) {
 	d.mux.Post(StartEvent{})
 	defer func() {
 		// reset on error
@@ -431,33 +433,55 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 			d.mux.Post(DoneEvent{latest})
 		}
 	}()
-	if p.version < eth.ETH66 {
-		return fmt.Errorf("%w: advertized %d < required %d", errTooOld, p.version, eth.ETH66)
-	}
 	mode := d.getMode()
 
-	log.Debug("Synchronising with the network", "peer", p.id, "eth", p.version, "head", hash, "td", td, "mode", mode)
+	if !beaconMode {
+		log.Debug("Synchronising with the network", "peer", p.id, "eth", p.version, "head", hash, "td", td, "mode", mode)
+	} else {
+		log.Debug("Backfilling with the network", "mode", mode)
+	}
 	defer func(start time.Time) {
 		log.Debug("Synchronisation terminated", "elapsed", common.PrettyDuration(time.Since(start)))
 	}(time.Now())
 
 	// Look up the sync boundaries: the common ancestor and the target block
-	latest, pivot, err := d.fetchHead(p)
-	if err != nil {
-		return err
-	}
-	if mode == SnapSync && pivot == nil {
-		// If no pivot block was returned, the head is below the min full block
-		// threshold (i.e. new chain). In that case we won't really fast sync
-		// anyway, but still need a valid pivot block to avoid some code hitting
-		// nil panics on an access.
-		pivot = d.blockchain.CurrentBlock().Header()
+	var latest, pivot *types.Header
+	if !beaconMode {
+		// In legacy mode, use the master peer to retrieve the headers from
+		latest, pivot, err = d.fetchHead(p)
+		if err != nil {
+			return err
+		}
+		if mode == SnapSync && pivot == nil {
+			// If no pivot block was returned, the head is below the min full block
+			// threshold (i.e. new chain). In that case we won't really fast sync
+			// anyway, but still need a valid pivot block to avoid some code hitting
+			// nil panics on an access.
+			pivot = d.blockchain.CurrentBlock().Header()
+		}
+	} else {
+		// In beacon mode, user the skeleton chain to retrieve the headers from
+		latest, err = d.skeleton.Head()
+		if err != nil {
+			return err
+		}
+		// Opposed to legacy mode, in beacon mode we trust the chain we've been
+		// told to sync to, so no need to leave a gap between the pivot and head
+		// to full sync
+		pivot = latest
 	}
 	height := latest.Number.Uint64()
 
-	origin, err := d.findAncestor(p, latest)
-	if err != nil {
-		return err
+	var origin uint64
+	if !beaconMode {
+		// In legacy mode, reach out to the network and find the ancestor
+		origin, err = d.findAncestor(p, latest)
+		if err != nil {
+			return err
+		}
+	} else {
+		// In beacon mode, use the skeleton chain for the ancestor lookup
+		origin = d.findBeaconAncestor()
 	}
 	d.syncStatsLock.Lock()
 	if d.syncStatsChainHeight <= origin || d.syncStatsChainOrigin > origin {
@@ -528,10 +552,18 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	if d.syncInitHook != nil {
 		d.syncInitHook(origin, height)
 	}
+	var headerFetcher func() error
+	if !beaconMode {
+		// In legacy mode, headers are retrieved from the network
+		headerFetcher = func() error { return d.fetchHeaders(p, origin+1) }
+	} else {
+		// In beacon mode, headers are served by the skeleton syncer
+		headerFetcher = func() error { return d.fetchBeaconHeaders(origin + 1) }
+	}
 	fetchers := []func() error{
-		func() error { return d.fetchHeaders(p, origin+1) }, // Headers are always retrieved
-		func() error { return d.fetchBodies(origin + 1) },   // Bodies are retrieved during normal and fast sync
-		func() error { return d.fetchReceipts(origin + 1) }, // Receipts are retrieved during fast sync
+		headerFetcher, // Headers are always retrieved
+		func() error { return d.fetchBodies(origin+1, beaconMode) },   // Bodies are retrieved during normal and fast sync
+		func() error { return d.fetchReceipts(origin+1, beaconMode) }, // Receipts are retrieved during fast sync
 		func() error { return d.processHeaders(origin+1, td) },
 	}
 	if mode == SnapSync {
@@ -1114,7 +1146,7 @@ func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) (
 	log.Debug("Filling up skeleton", "from", from)
 	d.queue.ScheduleSkeleton(from, skeleton)
 
-	err := d.concurrentFetch((*headerQueue)(d))
+	err := d.concurrentFetch((*headerQueue)(d), false)
 	log.Debug("Skeleton fill terminated", "err", err)
 
 	filled, proced := d.queue.RetrieveHeaders()
@@ -1124,9 +1156,9 @@ func (d *Downloader) fillHeaderSkeleton(from uint64, skeleton []*types.Header) (
 // fetchBodies iteratively downloads the scheduled block bodies, taking any
 // available peers, reserving a chunk of blocks for each, waiting for delivery
 // and also periodically checking for timeouts.
-func (d *Downloader) fetchBodies(from uint64) error {
+func (d *Downloader) fetchBodies(from uint64, beaconMode bool) error {
 	log.Debug("Downloading block bodies", "origin", from)
-	err := d.concurrentFetch((*bodyQueue)(d))
+	err := d.concurrentFetch((*bodyQueue)(d), beaconMode)
 
 	log.Debug("Block body download terminated", "err", err)
 	return err
@@ -1135,9 +1167,9 @@ func (d *Downloader) fetchBodies(from uint64) error {
 // fetchReceipts iteratively downloads the scheduled block receipts, taking any
 // available peers, reserving a chunk of receipts for each, waiting for delivery
 // and also periodically checking for timeouts.
-func (d *Downloader) fetchReceipts(from uint64) error {
+func (d *Downloader) fetchReceipts(from uint64, beaconMode bool) error {
 	log.Debug("Downloading receipts", "origin", from)
-	err := d.concurrentFetch((*receiptQueue)(d))
+	err := d.concurrentFetch((*receiptQueue)(d), beaconMode)
 
 	log.Debug("Receipt download terminated", "err", err)
 	return err

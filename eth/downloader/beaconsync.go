@@ -24,28 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
-// BeaconSync is the Ethereum 2 version of the chain synchronization, where the
-// chain is not downloaded from genesis onward, rather from trusted head announces
-// backwards.
-//
-// Internally backfilling and state sync is done the same way, but the header
-// retrieval and scheduling is replaced.
-func (d *Downloader) BeaconSync(mode SyncMode, head *types.Header) error {
-	// When the downloader starts a sync cycle, it needs to be aware of the sync
-	// mode to use (full, snap). To keep the skeleton chain oblivious, inject the
-	// mode into the backfiller directly.
-	//
-	// Super crazy dangerous type cast. Should be fine (TM), we're only using a
-	// different backfiller implementation for skeleton tests.
-	d.skeleton.filler.(*beaconBackfiller).setMode(mode)
-
-	// Signal the skeleton sync to switch to a new head, however it wants
-	if err := d.skeleton.Sync(head); err != nil {
-		return err
-	}
-	return nil
-}
-
 // beaconBackfiller is the chain and state backfilling that can be commenced once
 // the skeleton syncer has successfully reverse downloaded all the headers up to
 // the genesis block or an existing header in the database. Its operation is fully
@@ -112,4 +90,99 @@ func (b *beaconBackfiller) setMode(mode SyncMode) {
 	log.Error("Downloader sync mode changed mid-run", "old", mode.String(), "new", mode.String())
 	b.suspend()
 	b.resume()
+}
+
+// BeaconSync is the Ethereum 2 version of the chain synchronization, where the
+// chain is not downloaded from genesis onward, rather from trusted head announces
+// backwards.
+//
+// Internally backfilling and state sync is done the same way, but the header
+// retrieval and scheduling is replaced.
+func (d *Downloader) BeaconSync(mode SyncMode, head *types.Header) error {
+	// When the downloader starts a sync cycle, it needs to be aware of the sync
+	// mode to use (full, snap). To keep the skeleton chain oblivious, inject the
+	// mode into the backfiller directly.
+	//
+	// Super crazy dangerous type cast. Should be fine (TM), we're only using a
+	// different backfiller implementation for skeleton tests.
+	d.skeleton.filler.(*beaconBackfiller).setMode(mode)
+
+	// Signal the skeleton sync to switch to a new head, however it wants
+	if err := d.skeleton.Sync(head); err != nil {
+		return err
+	}
+	return nil
+}
+
+// findBeaconAncestor tries to locate the common ancestor link of the local chain
+// and the beacon chain just requested. In the general case when our node was in
+// sync and on the correct chain, checking the top N links should already get us
+// a match. In the rare scenario when we ended up on a long reorganisation (i.e.
+// none of the head links match), we do a binary search to find the ancestor.
+func (d *Downloader) findBeaconAncestor() uint64 {
+	// Figure out the current local head position
+	var head *types.Header
+
+	switch d.getMode() {
+	case FullSync:
+		head = d.blockchain.CurrentBlock().Header()
+	case SnapSync:
+		head = d.blockchain.CurrentFastBlock().Header()
+	default:
+		head = d.lightchain.CurrentHeader()
+	}
+	number := head.Number.Uint64()
+
+	// If the head is present in the skeleton chain, return that
+	if head.Hash() == d.skeleton.Header(number).Hash() {
+		return number
+	}
+	// Head header not present, binary search to find the ancestor
+	start, end := uint64(0), number
+	for start+1 < end {
+		// Split our chain interval in two, and request the hash to cross check
+		check := (start + end) / 2
+
+		h := d.skeleton.Header(check)
+		n := h.Number.Uint64()
+
+		var known bool
+		switch d.getMode() {
+		case FullSync:
+			known = d.blockchain.HasBlock(h.Hash(), n)
+		case SnapSync:
+			known = d.blockchain.HasFastBlock(h.Hash(), n)
+		default:
+			known = d.lightchain.HasHeader(h.Hash(), n)
+		}
+		if !known {
+			end = check
+			continue
+		}
+		start = check
+	}
+	return start
+}
+
+// fetchBeaconHeaders feeds skeleton headers to the downloader queue for scheduling
+// until sync errors or is finished.
+func (d *Downloader) fetchBeaconHeaders(from uint64) error {
+	head, err := d.skeleton.Head()
+	if err != nil {
+		return err
+	}
+	for from < head.Number.Uint64() {
+		// Retrieve a batch of headers and feed it to the header processor
+		headers := make([]*types.Header, 0, maxHeadersProcess)
+		for i := 0; i < maxHeadersProcess && from < head.Number.Uint64(); i++ {
+			headers = append(headers, d.skeleton.Header(from))
+			from++
+		}
+		select {
+		case d.headerProcCh <- headers:
+		case <-d.cancelCh:
+			return errCanceled
+		}
+	}
+	return nil
 }

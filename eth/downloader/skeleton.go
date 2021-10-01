@@ -47,15 +47,21 @@ const scratchHeaders = 131072
 // vs. dynamic interval fillings.
 const requestHeaders = 512
 
+// errSyncLinked is an internal helper error to signal that the current sync
+// cycle linked up to the genesis block, this the skeleton syncer should ping
+// the backfiller to resume. Since we already have that logic on sync start,
+// piggie-back on that instead of 2 entrypoints.
+var errSyncLinked = errors.New("sync linked")
+
 // errSyncMerged is an internal helper error to signal that the current sync
 // cycle merged with a previously aborted subchain, thus the skeleton syncer
 // should abort and restart with the new state.
-var errSyncMerged = errors.New("synced merged")
+var errSyncMerged = errors.New("sync merged")
 
 // errSyncReorged is an internal helper error to signal that the head chain of
 // the current sync cycle was (partially) reorged, thus the skeleton syncer
 // should abort and restart with the new state.
-var errSyncReorged = errors.New("synced reorged")
+var errSyncReorged = errors.New("sync reorged")
 
 // errTerminated is returned if the sync mechanism was terminated for this run of
 // the process. This is usually the case when Geth is shutting down and some events
@@ -166,7 +172,6 @@ type backfiller interface {
 // for now.
 type skeleton struct {
 	db     ethdb.Database // Database backing the skeleton
-	chain  LightChain     // Header chain accessor for cross links
 	filler backfiller     // Chain syncer suspended/resumed by head events
 
 	peers *peerSet                   // Set of peers we can sync from
@@ -236,10 +241,16 @@ func (s *skeleton) startup() {
 			// signalling as the sync loop should never terminate (TM).
 			newhead, err := s.sync(head)
 			switch {
+			case err == errSyncLinked:
+				// Sync cycle linked up to the genesis block. Tear down the loop
+				// and restart it so, it can properly notify the backfiller. Don't
+				// account a new head.
+				head = nil
+
 			case err == errSyncMerged:
 				// Subchains were merged, we just need to reinit the internal
 				// start to continue on the tail of the merged chain. Don't
-				// announce a new head
+				// announce a new head,
 				head = nil
 
 			case err == errSyncReorged:
@@ -298,7 +309,7 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	// If we're continuing a previous merge interrupt, just access the existing
 	// old state without initing from disk.
 	if head == nil {
-		head = rawdb.ReadSkeletonHeader(s.db, s.progress.Subchains[0].Tail)
+		head = rawdb.ReadSkeletonHeader(s.db, s.progress.Subchains[0].Head)
 	} else {
 		// Otherwise, initialize the sync, trimming and previous leftovers until
 		// we're consistent with the newly requested chain head
@@ -312,6 +323,13 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	defer func() { s.scratchOwners = nil }() // don't hold on to references after sync
 
 	s.scratchHead = s.progress.Subchains[0].Tail - 1 // tail must not be 0!
+
+	// If the sync is already done, resume the backfiller. When the loop stops,
+	// terminate the backfiller too.
+	if s.scratchHead == 0 {
+		s.filler.resume()
+	}
+	defer s.filler.suspend()
 
 	// Create a set of unique channels for this sync cycle. We need these to be
 	// ephemeral so a data race doesn't accidentally deliver something stale on
@@ -389,6 +407,11 @@ func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 			if merged := s.processResponse(res); merged {
 				return nil, errSyncMerged
 			}
+			// If we've just reached the genesis block, tear down the sync cycle
+			// and restart it to resume the backfiller. We could just as well do
+			// a signalling here, but it's a tad cleaner to have only one entry
+			// pathway to suspending/resuming it.
+			return nil, errSyncLinked
 		}
 	}
 }
@@ -503,15 +526,15 @@ func (s *skeleton) processNewHead(head *types.Header) bool {
 
 	lastchain := s.progress.Subchains[0]
 	if lastchain.Tail >= number {
-		log.Info("Header skeleton reorged", "tail", lastchain.Tail, "newHead", number)
+		log.Warn("Beacon chain reorged", "tail", lastchain.Tail, "newHead", number)
 		return true
 	}
 	if lastchain.Head+1 < number {
-		log.Info("Header skeleton gapped", "head", lastchain.Head, "newHead", number)
+		log.Warn("Beacon chain gapped", "head", lastchain.Head, "newHead", number)
 		return true
 	}
 	if parent := rawdb.ReadSkeletonHeader(s.db, number-1); parent.Hash() != head.ParentHash {
-		log.Info("Header skeleton forked", "ancestor", parent.Number, "hash", parent.Hash(), "want", head.ParentHash)
+		log.Warn("Beacon chain forked", "ancestor", parent.Number, "hash", parent.Hash(), "want", head.ParentHash)
 		return true
 	}
 	// New header seems to be in the last subchain range. Unwind any extra headers
@@ -619,7 +642,7 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 	peer.log.Trace("Fetching skeleton headers", "from", req.head, "count", requestCount)
 	netreq, err := peer.peer.RequestHeadersByNumber(req.head, requestCount, 0, true, resCh)
 	if err != nil {
-		peer.log.Debug("Failed to request headers", "err", err)
+		peer.log.Trace("Failed to request headers", "err", err)
 		s.scheduleRevertRequest(req)
 		return
 	}
@@ -638,7 +661,7 @@ func (s *skeleton) executeTask(peer *peerConnection, req *headerRequest) {
 
 	case <-timeoutTimer.C:
 		// Header retrieval timed out, update the metrics
-		peer.log.Debug("Header request timed out", "elapsed", ttl)
+		peer.log.Trace("Header request timed out", "elapsed", ttl)
 		headerTimeoutMeter.Mark(1)
 		s.peers.rates.Update(peer.id, eth.BlockHeadersMsg, 0, 0)
 		s.scheduleRevertRequest(req)
@@ -740,7 +763,7 @@ func (s *skeleton) scheduleRevertRequest(req *headerRequest) {
 // Note, this needs to run on the event runloop thread to reschedule to idle peers.
 // On peer threads, use scheduleRevertRequest.
 func (s *skeleton) revertRequest(req *headerRequest) {
-	log.Debug("Reverting header request", "peer", req.peer, "reqid", req.id)
+	log.Trace("Reverting header request", "peer", req.peer, "reqid", req.id)
 	select {
 	case <-req.stale:
 		log.Trace("Header request already reverted", "peer", req.peer, "reqid", req.id)
@@ -809,8 +832,11 @@ func (s *skeleton) processResponse(res *headerResponse) bool {
 		}
 		// Scratch delivery matches required subchain, deliver the batch of
 		// headers and push the subchain forward
+		var consumed int
 		for _, header := range s.scratchSpace[:requestHeaders] {
 			if header != nil { // nil when the genesis is reached
+				consumed++
+
 				rawdb.WriteSkeletonHeader(batch, header)
 				s.pulled++
 
@@ -832,7 +858,7 @@ func (s *skeleton) processResponse(res *headerResponse) bool {
 		copy(s.scratchOwners, s.scratchOwners[1:])
 		s.scratchOwners[scratchHeaders/requestHeaders-1] = ""
 
-		s.scratchHead -= requestHeaders
+		s.scratchHead -= uint64(consumed)
 
 		// If the subchain extended into the next subchain, we need to handle
 		// the overlap. Since there could be many overlaps (come on), do this
@@ -872,16 +898,55 @@ func (s *skeleton) processResponse(res *headerResponse) bool {
 		log.Crit("Failed to write skeleton headers and progress", "err", err)
 	}
 	// Print a progress report to make the UX a bit nicer
-	if time.Since(s.logged) > 8*time.Second {
+	left := s.progress.Subchains[0].Tail - 1
+	if time.Since(s.logged) > 8*time.Second || left == 0 {
 		s.logged = time.Now()
 
-		outstanding := s.progress.Subchains[0].Tail
 		if s.pulled == 0 {
-			log.Info("Reverse header sync starting", "outstanding", outstanding)
+			log.Info("Beacon sync starting", "left", left)
 		} else {
-			eta := float64(time.Since(s.started)) / float64(s.pulled) * float64(outstanding)
-			log.Info("Reverse header sync in progress", "downloaded", s.pulled, "outstanding", outstanding, "eta", common.PrettyDuration(eta))
+			eta := float64(time.Since(s.started)) / float64(s.pulled) * float64(left)
+			log.Info("Syncing beacon headers", "downloaded", s.pulled, "left", left, "eta", common.PrettyDuration(eta))
 		}
 	}
 	return merged
+}
+
+// Head retrieves the current head tracked by the skeleton syncer. This method
+// is meant to be used by the backfiller, whose life cycle is controlled by the
+// skeleton syncer.
+//
+// Note, the method will not use the internal state of the skeleton, but will
+// rather blindly pull stuff from the database. This is fine, because the back-
+// filler will only run when the skeleton chain is fully downloaded and stable.
+// There might be new heads appended, but those are stomic from the perspective
+// of this method. Any head reorg will first tear down the backfiller and only
+// then make the modification.
+func (s *skeleton) Head() (*types.Header, error) {
+	// Read the current sync progress from disk and figure out the current head.
+	// Although there's a lot of error handling here, these are mostly as sanity
+	// checks to avoid crashing if a programming error happens. These should not
+	// happen in live code.
+	status := rawdb.ReadSkeletonSyncStatus(s.db)
+	if len(status) == 0 {
+		return nil, errors.New("beacon sync not yet started")
+	}
+	s.progress = new(skeletonProgress)
+	if err := json.Unmarshal(status, s.progress); err != nil {
+		return nil, err
+	}
+	if s.progress.Subchains[0].Tail != 1 {
+		return nil, errors.New("beacon sync not yet finished")
+	}
+	return rawdb.ReadSkeletonHeader(s.db, s.progress.Subchains[0].Head), nil
+}
+
+// Header retrieves a specific header tracked by the skeleton syncer. This method
+// is meant to be used by the backfiller, whose life cycle is controlled by the
+// skeleton syncer.
+//
+// Note, outside the permitted runtimes, this method might return nil results and
+// subsequent calls might return headers from different chains.
+func (s *skeleton) Header(number uint64) *types.Header {
+	return rawdb.ReadSkeletonHeader(s.db, number)
 }
