@@ -27,6 +27,43 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+// hookedBackfiller is a tester backfiller with all interface methods mocked and
+// hooked so tests can implement only the things they need.
+type hookedBackfiller struct {
+	// suspendHook is an optional hook to be called when the filler is requested
+	// to be suspended.
+	suspendHook func()
+
+	// resumeHook is an optional hook to be called when the filler is requested
+	// to be resumed.
+	resumeHook func()
+}
+
+// suspend requests the backfiller to abort any running full or snap sync
+// based on the skeleton chain as it might be invalid. The backfiller should
+// gracefully handle multiple consecutive suspends without a resume, even
+// on initial sartup.
+func (hf *hookedBackfiller) suspend() {
+	if hf.suspendHook != nil {
+		hf.suspendHook()
+	}
+}
+
+// resume requests the backfiller to start running fill or snap sync based on
+// the skeleton chain as it has successfully been linked. Appending new heads
+// to the end of the chain will not result in suspend/resume cycles.
+func (hf *hookedBackfiller) resume() {
+	if hf.resumeHook != nil {
+		hf.resumeHook()
+	}
+}
+
+// newNoopBackfiller creates a hooked backfiller with all callbacks disabled,
+// essentially acting as a noop.
+func newNoopBackfiller() backfiller {
+	return new(hookedBackfiller)
+}
+
 // Tests various sync initialzations based on previous leftovers in the database
 // and announced heads.
 func TestSkeletonSyncInit(t *testing.T) {
@@ -191,9 +228,14 @@ func TestSkeletonSyncInit(t *testing.T) {
 			rawdb.WriteSkeletonSyncStatus(db, blob)
 		}
 		// Create a skeleton sync and run a cycle
-		skeleton := newSkeleton(db, newPeerSet(), func(string) {})
-		go skeleton.Sync(tt.head)
-		skeleton.Abort()
+		wait := make(chan struct{})
+
+		skeleton := newSkeleton(db, newPeerSet(), func(string) {}, newNoopBackfiller())
+		skeleton.syncStarting = func() { close(wait) }
+		skeleton.Sync(tt.head)
+
+		<-wait
+		skeleton.Terminate()
 
 		// Ensure the correct resulting sync status
 		var progress skeletonProgress

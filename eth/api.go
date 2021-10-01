@@ -256,6 +256,12 @@ func (api *PrivateAdminAPI) ImportChain(file string) (bool, error) {
 	return true, nil
 }
 
+/*
+// NewHead requests the node to beacon-sync to the designated head header.
+func (api *PrivateAdminAPI) NewHead(header) (bool, error) {
+
+}*/
+
 // PublicDebugAPI is the collection of Ethereum full node APIs exposed
 // over the public debugging endpoint.
 type PublicDebugAPI struct {

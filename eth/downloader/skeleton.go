@@ -19,7 +19,6 @@ package downloader
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math/rand"
 	"sort"
 	"time"
@@ -53,18 +52,22 @@ const requestHeaders = 512
 // should abort and restart with the new state.
 var errSyncMerged = errors.New("synced merged")
 
+// errSyncReorged is an internal helper error to signal that the head chain of
+// the current sync cycle was (partially) reorged, thus the skeleton syncer
+// should abort and restart with the new state.
+var errSyncReorged = errors.New("synced reorged")
+
+// errTerminated is returned if the sync mechanism was terminated for this run of
+// the process. This is usually the case when Geth is shutting down and some events
+// might still be propagating.
+var errTerminated = errors.New("terminated")
+
 func init() {
 	// Tuning parameters is nice, but the scratch space must be assignable in
 	// full to peers. It's a useless cornercase to support a dangling half-group.
 	if scratchHeaders%requestHeaders != 0 {
 		panic("Please make scratchHeaders divisible by requestHeaders")
 	}
-}
-
-// headEvent is a notification that the chain should reorg to a new head.
-type headEvent struct {
-	header *types.Header // New chain head to reorg to
-	result chan error    // Channel to return if the head was accepted or denied
 }
 
 // subchain is a contiguous header chain segment that is backed by the database,
@@ -118,6 +121,22 @@ type headerResponse struct {
 	headers []*types.Header // Chain of headers
 }
 
+// backfiller is a callback interface through which the skeleton sync can tell
+// the downloader that it should suspend or resume backfilling on specific head
+// events (e.g. suspend on forks or gaps, resume on successfull linkups).
+type backfiller interface {
+	// suspend requests the backfiller to abort any running full or snap sync
+	// based on the skeleton chain as it might be invalid. The backfiller should
+	// gracefully handle multiple consecutive suspends without a resume, even
+	// on initial sartup.
+	suspend()
+
+	// resume requests the backfiller to start running fill or snap sync based on
+	// the skeleton chain as it has successfully been linked. Appending new heads
+	// to the end of the chain will not result in suspend/resume cycles.
+	resume()
+}
+
 // skeleton represents a header chain synchronized after the Ethereum 2 merge,
 // where blocks aren't validated any more via PoW in a forward fashion, rather
 // are dictated and extended at the head via the beacon chain and backfilled on
@@ -146,8 +165,9 @@ type headerResponse struct {
 // is wasted disk IO, but it's a price we're going to pay to keep things simple
 // for now.
 type skeleton struct {
-	db    ethdb.Database // Database backing the skeleton
-	chain LightChain     // Header chain accessor for cross links
+	db     ethdb.Database // Database backing the skeleton
+	chain  LightChain     // Header chain accessor for cross links
+	filler backfiller     // Chain syncer suspended/resumed by head events
 
 	peers *peerSet                   // Set of peers we can sync from
 	idles map[string]*peerConnection // Set of idle peers in the current sync cycle
@@ -164,46 +184,117 @@ type skeleton struct {
 
 	requests map[uint64]*headerRequest // Header requests currently running
 
-	headEvents chan *headEvent // Notification channel for new heads
-	abortSync  chan chan error // Termination channel to abort sync
+	headEvents chan *types.Header // Notification channel for new heads
+	terminate  chan chan error    // Termination channel to abort sync
+	terminated chan struct{}      // Channel to signal that the syner is dead
+
+	// Callback hooks used during testing
+	syncStarting func() // callback triggered after a sync cycle is inited but before started
 }
 
 // newSkeleton creates a new sync skeleton that tracks a potentially dangling
 // header chain until it's linked into an existing set of blocks.
-func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn) *skeleton {
-	return &skeleton{
+func newSkeleton(db ethdb.Database, peers *peerSet, drop peerDropFn, filler backfiller) *skeleton {
+	sk := &skeleton{
 		db:         db,
+		filler:     filler,
 		peers:      peers,
 		drop:       drop,
 		requests:   make(map[uint64]*headerRequest),
-		headEvents: make(chan *headEvent),
-		abortSync:  make(chan chan error),
+		headEvents: make(chan *types.Header),
+		terminate:  make(chan chan error),
+		terminated: make(chan struct{}),
 	}
+	go sk.startup()
+	return sk
+}
+
+// startup is an initial background loop which waits for an event to start or
+// tear the syncer down. This is required to make the skeleton sync loop once
+// per process but at the same time not start before the beacon chain announces
+// a new (existing) head.
+func (s *skeleton) startup() {
+	// Close a notification channel so anyone sending us events will know if the
+	// sync loop was torn down for good.
+	defer close(s.terminated)
+
+	// Wait for startup or teardown
+	select {
+	case errc := <-s.terminate:
+		// No head was announced but Geth is shutting down
+		errc <- nil
+		return
+
+	case head := <-s.headEvents:
+		// New head announced, start syncing to it, looping every time a current
+		// cycle is terminated due to a chain event (head reorg, old chain merge)
+		s.started = time.Now()
+
+		for {
+			// If the sync cycle terminated or was terminated, propagate up when
+			// higher layers request termination. There's no fancy explicit error
+			// signalling as the sync loop should never terminate (TM).
+			newhead, err := s.sync(head)
+			switch {
+			case err == errSyncMerged:
+				// Subchains were merged, we just need to reinit the internal
+				// start to continue on the tail of the merged chain. Don't
+				// announce a new head
+				head = nil
+
+			case err == errSyncReorged:
+				// The subchain being synced got modified at the head in a
+				// way that requires resyncing it. Restart sync with the new
+				// head to force a cleanup.
+				head = newhead
+
+			case err == errTerminated:
+				// Sync was requested to be terminated from within, stop and
+				// return (no need to pass a message, was already done internally)
+				return
+
+			default:
+				// Sync either successfully terminated or failed with an unhandled
+				// error. Abort and wait until Geth requests a termination.
+				errc := <-s.terminate
+				errc <- err
+				return
+			}
+		}
+	}
+}
+
+// Terminate tears down the syncer indefinitely.
+func (s *skeleton) Terminate() error {
+	// Request termination and fetch any errors
+	errc := make(chan error)
+	s.terminate <- errc
+	err := <-errc
+
+	// Wait for full shutdown (not necessary, but cleaner)
+	<-s.terminated
+	return err
 }
 
 // Sync starts or resumes a previous sync cycle to download and maintain a reverse
 // header chain starting at the head and leading towards genesis to an available
 // ancestor.
+//
+// This method does not block, rather it just waits until the syncer receives the
+// fed header. What the syncer does with it is the syncer's problem.
 func (s *skeleton) Sync(head *types.Header) error {
-	// Initialie the skeleton timer once on initial startup
-	if s.started.IsZero() {
-		s.started = time.Now()
-	}
-	for {
-		// If the sync cycle terminated or was terminated, propagate up
-		if err := s.sync(head); err != errSyncMerged {
-			return err
-		}
-		// Sync cycle merged with a previously aborted one, request a continuation
-		// with a fresh scratch space
-		head = nil // Use existing head instead of specific one
+	select {
+	case s.headEvents <- head:
+		return nil
+	case <-s.terminated:
+		return errTerminated
 	}
 }
 
 // sync is the internal version of Sync that executes a single sync cycle, either
 // until some termination condition is reached, or until the current cycle merges
 // with a previously aborted run.
-func (s *skeleton) sync(head *types.Header) error {
+func (s *skeleton) sync(head *types.Header) (*types.Header, error) {
 	// If we're continuing a previous merge interrupt, just access the existing
 	// old state without initing from disk.
 	if head == nil {
@@ -250,7 +341,10 @@ func (s *skeleton) sync(head *types.Header) error {
 	for _, peer := range s.peers.AllPeers() {
 		s.idles[peer.id] = peer
 	}
-
+	// Nofity any tester listening for startup events
+	if s.syncStarting != nil {
+		s.syncStarting()
+	}
 	for {
 		// Something happened, try to assign new tasks to any idle peers
 		s.assingTasks(responses, requestFails, cancel)
@@ -268,17 +362,19 @@ func (s *skeleton) sync(head *types.Header) error {
 				delete(s.idles, peerid)
 			}
 
-		case errc := <-s.abortSync:
+		case errc := <-s.terminate:
 			errc <- nil
-			return nil
+			return nil, errTerminated
 
 		case head := <-s.headEvents:
 			// New head was announced, try to integrate it. If successful, nothing
 			// needs to be done as the head simply extended the last range. For now
 			// we don't seamlessly integrate reorgs to keep things simple. If the
 			// network starts doing many mini reorgs, it might be worthwhile handling
-			// a limited depth without an error (TODO(karalabe)).
-			s.processNewHead(head)
+			// a limited depth without an error.
+			if reorged := s.processNewHead(head); reorged {
+				return head, errSyncReorged
+			}
 
 		case req := <-requestFails:
 			s.revertRequest(req)
@@ -291,7 +387,7 @@ func (s *skeleton) sync(head *types.Header) error {
 			// the extended subchain, but since the scenario is rare, it's cleaner
 			// to rely on the restart mechanism than a stateful modification.
 			if merged := s.processResponse(res); merged {
-				return errSyncMerged
+				return nil, errSyncMerged
 			}
 		}
 	}
@@ -397,25 +493,26 @@ func (s *skeleton) saveSyncStatus(db ethdb.KeyValueWriter) {
 }
 
 // processNewHead does the internal shuffling for a new head marker and either
-// accepts and integrates it into the skeleton or rejects it. Upon rejection,
-// it's up to the caller to tear down the sync cycle and restart it.
-func (s *skeleton) processNewHead(head *headEvent) {
+// accepts and integrates it into the skeleton or requests a reorg. Upon reorg,
+// the syncer will tear itself down and restart with a fresh head. It is simpler
+// to reconstruct the sync state than to mutate it and hope for the best.
+func (s *skeleton) processNewHead(head *types.Header) bool {
 	// If the header cannot be inserted without interruption, return an error for
-	// the downloader to tear down the skeleton sync and restart it
-	number := head.header.Number.Uint64()
+	// the outer loop to tear down the skeleton sync and restart it
+	number := head.Number.Uint64()
 
 	lastchain := s.progress.Subchains[0]
 	if lastchain.Tail >= number {
-		head.result <- fmt.Errorf("skeleton reorged: tail: %d, newHead: %d", lastchain.Tail, number)
-		return
+		log.Info("Header skeleton reorged", "tail", lastchain.Tail, "newHead", number)
+		return true
 	}
 	if lastchain.Head+1 < number {
-		head.result <- fmt.Errorf("skeleton gapped: head: %d, newHead: %d", lastchain.Head, number)
-		return
+		log.Info("Header skeleton gapped", "head", lastchain.Head, "newHead", number)
+		return true
 	}
-	if parent := rawdb.ReadSkeletonHeader(s.db, number-1); parent.Hash() != head.header.ParentHash {
-		head.result <- fmt.Errorf("skeleton forked: ancestor: %d [%x], newAncestor: %d [%x]", parent.Number, parent.Hash(), number-1, head.header.ParentHash)
-		return
+	if parent := rawdb.ReadSkeletonHeader(s.db, number-1); parent.Hash() != head.ParentHash {
+		log.Info("Header skeleton forked", "ancestor", parent.Number, "hash", parent.Hash(), "want", head.ParentHash)
+		return true
 	}
 	// New header seems to be in the last subchain range. Unwind any extra headers
 	// from the chain tip and insert the new head. We won't delete any trimmed
@@ -424,35 +521,14 @@ func (s *skeleton) processNewHead(head *headEvent) {
 	// blocks above the current head (TODO(karalabe): don't forget).
 	batch := s.db.NewBatch()
 
-	rawdb.WriteSkeletonHeader(batch, head.header)
+	rawdb.WriteSkeletonHeader(batch, head)
 	lastchain.Head = number
 	s.saveSyncStatus(batch)
 
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write skeleton sync status", "err", err)
 	}
-	// Notify the new head event that it's been successfully processed
-	head.result <- nil
-}
-
-// Abort tears down the current sync cycle. Note, if no sync cycle is running,
-// this method will block.
-func (s *skeleton) Abort() error {
-	errc := make(chan error)
-	s.abortSync <- errc
-	return <-errc
-}
-
-// OnNewHead is a notification when we receive a new head marker from the beacon
-// chain node. The method will either extend the current sync cycle seamlessly,
-// or if the new header cannot be linked to the existing chain, it will tear down
-// and restart sync.
-func (s *skeleton) OnNewHead(header *types.Header) error {
-	event := &headEvent{
-		header: header,
-		result: make(chan error),
-	}
-	return <-event.result
+	return false
 }
 
 // assingTasks attempts to match idle peers to pending header retrievals.
