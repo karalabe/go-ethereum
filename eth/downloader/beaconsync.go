@@ -18,6 +18,8 @@ package downloader
 
 import (
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -171,10 +173,10 @@ func (d *Downloader) fetchBeaconHeaders(from uint64) error {
 	if err != nil {
 		return err
 	}
-	for from < head.Number.Uint64() {
+	for {
 		// Retrieve a batch of headers and feed it to the header processor
 		headers := make([]*types.Header, 0, maxHeadersProcess)
-		for i := 0; i < maxHeadersProcess && from < head.Number.Uint64(); i++ {
+		for i := 0; i < maxHeadersProcess && from <= head.Number.Uint64(); i++ {
 			headers = append(headers, d.skeleton.Header(from))
 			from++
 		}
@@ -183,6 +185,24 @@ func (d *Downloader) fetchBeaconHeaders(from uint64) error {
 		case <-d.cancelCh:
 			return errCanceled
 		}
+		// If we still have headers to import, loop and keep pushing them
+		if from <= head.Number.Uint64() {
+			continue
+		}
+		// If the pivot block is committed, signal header sync termination
+		if atomic.LoadInt32(&d.committed) == 1 {
+			d.headerProcCh <- nil
+			return nil
+		}
+		// State sync still going, wait a bit for new headers and retry
+		select {
+		case <-time.After(fsHeaderContCheck):
+		case <-d.cancelCh:
+			return errCanceled
+		}
+		head, err = d.skeleton.Head()
+		if err != nil {
+			return err
+		}
 	}
-	return nil
 }
