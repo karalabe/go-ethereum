@@ -490,7 +490,7 @@ func (s *skeleton) initSync(head *types.Header) {
 		}
 	}
 	// Either we've failed to decode the previus state, or there was none. Start
-	// a fresh sync with a single subchain represente db by the currently sent
+	// a fresh sync with a single subchain represented by the currently sent
 	// chain head.
 	s.progress = &skeletonProgress{
 		Subchains: []*subchain{
@@ -501,8 +501,14 @@ func (s *skeleton) initSync(head *types.Header) {
 			},
 		},
 	}
-	s.saveSyncStatus(s.db)
+	batch := s.db.NewBatch()
 
+	rawdb.WriteSkeletonHeader(batch, head)
+	s.saveSyncStatus(batch)
+
+	if err := batch.Write(); err != nil {
+		log.Crit("Failed to write initial skeleton sync status", "err", err)
+	}
 	log.Debug("Created initial skeleton subchain", "head", number, "tail", number)
 }
 
