@@ -33,14 +33,16 @@ import (
 type beaconBackfiller struct {
 	downloader *Downloader // Downloader to direct via this callback implementation
 	syncMode   SyncMode    // Sync mode to use for backfilling the skeleton chains
+	success    func()      // Callback to run on successful sync cycle completion
 	filling    bool        // Flag whether the downloader is backfilling or not
 	lock       sync.Mutex  // Mutex protecting the sync lock
 }
 
 // newBeaconBackfiller is a helper method to create the backfiller.
-func newBeaconBackfiller(dl *Downloader) backfiller {
+func newBeaconBackfiller(dl *Downloader, success func()) backfiller {
 	return &beaconBackfiller{
 		downloader: dl,
+		success:    success,
 	}
 }
 
@@ -70,6 +72,11 @@ func (b *beaconBackfiller) resume() {
 		if err := b.downloader.synchronise("", common.Hash{}, nil, mode, true); err != nil {
 			log.Error("Beacon backfilling failed", "err", err)
 			return
+		}
+		// Synchronization succeeded. Since this happens async, notify the outer
+		// context to disable snap syncing and enable transaction propagation.
+		if b.success != nil {
+			b.success()
 		}
 	}()
 }

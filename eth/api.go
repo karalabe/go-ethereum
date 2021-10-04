@@ -263,7 +263,7 @@ func (api *PrivateAdminAPI) NewHead(blob hexutil.Bytes) error {
 		return err
 	}
 	mode, _ := api.eth.handler.chainSync.modeAndLocalHead()
-	return api.eth.Downloader().BeaconSync(mode, header) // TODO(karalabe): implement snap->full snap
+	return api.eth.Downloader().BeaconSync(mode, header)
 }
 
 // PublicDebugAPI is the collection of Ethereum full node APIs exposed

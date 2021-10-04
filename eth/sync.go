@@ -229,10 +229,6 @@ func (h *handler) doSync(op *chainSyncOp) error {
 		return err
 	}
 	if atomic.LoadUint32(&h.snapSync) == 1 {
-		log.Info("Fast sync complete, auto disabling")
-		atomic.StoreUint32(&h.snapSync, 0)
-	}
-	if atomic.LoadUint32(&h.snapSync) == 1 {
 		log.Info("Snap sync complete, auto disabling")
 		atomic.StoreUint32(&h.snapSync, 0)
 	}
