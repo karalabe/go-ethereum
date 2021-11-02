@@ -62,6 +62,7 @@ func (h *handler) syncTransactions(p *eth.Peer) {
 
 // chainSyncer coordinates blockchain sync components.
 type chainSyncer struct {
+	ttd         *big.Int // Terminal difficulty to leave self-triggering sync
 	handler     *handler
 	force       *time.Timer
 	forced      bool // true when force timer fired
@@ -80,6 +81,7 @@ type chainSyncOp struct {
 // newChainSyncer creates a chainSyncer.
 func newChainSyncer(handler *handler) *chainSyncer {
 	return &chainSyncer{
+		ttd:         handler.chain.Config().TerminalTotalDifficulty,
 		handler:     handler,
 		peerEventCh: make(chan struct{}),
 	}
@@ -145,7 +147,6 @@ func (cs *chainSyncer) nextSyncOp() *chainSyncOp {
 	if cs.doneCh != nil {
 		return nil // Sync already running.
 	}
-
 	// Ensure we're at minimum peer count.
 	minPeers := defaultMinSyncPeers
 	if cs.forced {
@@ -156,8 +157,10 @@ func (cs *chainSyncer) nextSyncOp() *chainSyncOp {
 	if cs.handler.peers.len() < minPeers {
 		return nil
 	}
-	// We have enough peers, check TD
-	peer := cs.handler.peers.peerWithHighestTD()
+	// We have enough peers, pick the one with the highest TD, but avoid going
+	// over the terminal total difficulty. Above that we expect the consensus
+	// clients to direct the chain head to sync to.
+	peer := cs.handler.peers.peerWithHighestTD(cs.ttd)
 	if peer == nil {
 		return nil
 	}

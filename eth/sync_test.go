@@ -69,7 +69,7 @@ func testFastSyncDisabling(t *testing.T, protocol uint) {
 	time.Sleep(250 * time.Millisecond)
 
 	// Check that fast sync was disabled
-	op := peerToSyncOp(downloader.FastSync, empty.handler.peers.peerWithHighestTD())
+	op := peerToSyncOp(downloader.FastSync, empty.handler.peers.peerWithHighestTD(nil))
 	if err := empty.handler.doSync(op); err != nil {
 		t.Fatal("sync failed:", err)
 	}
