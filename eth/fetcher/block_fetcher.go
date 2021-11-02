@@ -468,7 +468,7 @@ func (f *BlockFetcher) loop() {
 					}
 					for _, hash := range hashes {
 						headerFetchMeter.Mark(1)
-						go func() {
+						go func(hash common.Hash) {
 							resCh := make(chan *eth.Response)
 
 							req, err := fetchHeader(hash, resCh)
@@ -481,7 +481,7 @@ func (f *BlockFetcher) loop() {
 							res.Done <- nil
 
 							f.FilterHeaders(peer, *res.Res.(*eth.BlockHeadersPacket), time.Now().Add(res.Time))
-						}()
+						}(hash)
 					}
 				}(peer)
 			}

@@ -263,6 +263,8 @@ func (f *fetcherTester) makeBodyFetcher(peer string, blocks map[common.Hash]*typ
 
 // verifyFetchingEvent verifies that one single event arrive on a fetching channel.
 func verifyFetchingEvent(t *testing.T, fetching chan []common.Hash, arrive bool) {
+	t.Helper()
+
 	if arrive {
 		select {
 		case <-fetching:
@@ -280,6 +282,8 @@ func verifyFetchingEvent(t *testing.T, fetching chan []common.Hash, arrive bool)
 
 // verifyCompletingEvent verifies that one single event arrive on an completing channel.
 func verifyCompletingEvent(t *testing.T, completing chan []common.Hash, arrive bool) {
+	t.Helper()
+
 	if arrive {
 		select {
 		case <-completing:
@@ -297,6 +301,8 @@ func verifyCompletingEvent(t *testing.T, completing chan []common.Hash, arrive b
 
 // verifyImportEvent verifies that one single event arrive on an import channel.
 func verifyImportEvent(t *testing.T, imported chan interface{}, arrive bool) {
+	t.Helper()
+
 	if arrive {
 		select {
 		case <-imported:
@@ -315,6 +321,8 @@ func verifyImportEvent(t *testing.T, imported chan interface{}, arrive bool) {
 // verifyImportCount verifies that exactly count number of events arrive on an
 // import hook channel.
 func verifyImportCount(t *testing.T, imported chan interface{}, count int) {
+	t.Helper()
+
 	for i := 0; i < count; i++ {
 		select {
 		case <-imported:
@@ -327,6 +335,8 @@ func verifyImportCount(t *testing.T, imported chan interface{}, count int) {
 
 // verifyImportDone verifies that no more events are arriving on an import channel.
 func verifyImportDone(t *testing.T, imported chan interface{}) {
+	t.Helper()
+
 	select {
 	case <-imported:
 		t.Fatalf("extra block imported")
@@ -336,6 +346,8 @@ func verifyImportDone(t *testing.T, imported chan interface{}) {
 
 // verifyChainHeight verifies the chain height is as expected.
 func verifyChainHeight(t *testing.T, fetcher *fetcherTester, height uint64) {
+	t.Helper()
+
 	if fetcher.chainHeight() != height {
 		t.Fatalf("chain height mismatch, got %d, want %d", fetcher.chainHeight(), height)
 	}
