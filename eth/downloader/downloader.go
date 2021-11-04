@@ -54,11 +54,11 @@ var (
 	reorgProtThreshold   = 48 // Threshold number of recent blocks to disable mini reorg protection
 	reorgProtHeaderDelay = 2  // Number of headers to delay delivering to cover mini reorgs
 
-	fsHeaderCheckFrequency = 100             // Verification frequency of the downloaded headers during fast sync
+	fsHeaderCheckFrequency = 100             // Verification frequency of the downloaded headers during snap sync
 	fsHeaderSafetyNet      = 2048            // Number of headers to discard in case a chain violation is detected
 	fsHeaderForceVerify    = 24              // Number of headers to verify before and after the pivot to accept it
 	fsHeaderContCheck      = 3 * time.Second // Time interval to check for header continuations during state download
-	fsMinFullBlocks        = 64              // Number of blocks to retrieve fully even in fast sync
+	fsMinFullBlocks        = 64              // Number of blocks to retrieve fully even in snap sync
 )
 
 var (
@@ -87,13 +87,13 @@ type Downloader struct {
 	mode uint32         // Synchronisation mode defining the strategy used (per sync cycle), use d.getMode() to get the SyncMode
 	mux  *event.TypeMux // Event multiplexer to announce sync operation events
 
-	checkpoint uint64   // Checkpoint block number to enforce head against (e.g. fast sync)
+	checkpoint uint64   // Checkpoint block number to enforce head against (e.g. snap sync)
 	genesis    uint64   // Genesis block number to limit sync to (e.g. light client CHT)
 	queue      *queue   // Scheduler for selecting the hashes to download
 	peers      *peerSet // Set of active peers from which download can proceed
 
 	stateDB    ethdb.Database  // Database to state sync into (and deduplicate via)
-	stateBloom *trie.SyncBloom // Bloom filter for fast trie node and contract code existence checks
+	stateBloom *trie.SyncBloom // Bloom filter for snap trie node and contract code existence checks
 
 	// Statistics
 	syncStatsChainOrigin uint64       // Origin block number where syncing started at
@@ -161,14 +161,14 @@ type LightChain interface {
 	SetHead(uint64) error
 }
 
-// BlockChain encapsulates functions required to sync a (full or fast) blockchain.
+// BlockChain encapsulates functions required to sync a (full or snap) blockchain.
 type BlockChain interface {
 	LightChain
 
 	// HasBlock verifies a block's presence in the local chain.
 	HasBlock(common.Hash, uint64) bool
 
-	// HasFastBlock verifies a fast block's presence in the local chain.
+	// HasFastBlock verifies a snap block's presence in the local chain.
 	HasFastBlock(common.Hash, uint64) bool
 
 	// GetBlockByHash retrieves a block from the local chain.
@@ -177,7 +177,7 @@ type BlockChain interface {
 	// CurrentBlock retrieves the head block from the local chain.
 	CurrentBlock() *types.Block
 
-	// CurrentFastBlock retrieves the head fast block from the local chain.
+	// CurrentFastBlock retrieves the head snap block from the local chain.
 	CurrentFastBlock() *types.Block
 
 	// FastSyncCommitHead directly commits the head block to a certain entity.
@@ -221,7 +221,7 @@ func New(checkpoint uint64, stateDb ethdb.Database, stateBloom *trie.SyncBloom, 
 // block where synchronisation started at (may have failed/suspended); the block
 // or header sync is currently at; and the latest known block which the sync targets.
 //
-// In addition, during the state download phase of fast synchronisation the number
+// In addition, during the state download phase of snap synchronisation the number
 // of processed and the total number of known states are also returned. Otherwise
 // these are zero.
 func (d *Downloader) Progress() ethereum.SyncProgress {
@@ -356,14 +356,14 @@ func (d *Downloader) synchronise(id string, hash common.Hash, td *big.Int, mode 
 	if atomic.CompareAndSwapInt32(&d.notified, 0, 1) {
 		log.Info("Block synchronisation started")
 	}
-	// If we are already full syncing, but have a fast-sync bloom filter laying
+	// If we are already full syncing, but have a snap-sync bloom filter laying
 	// around, make sure it doesn't use memory any more. This is a special case
-	// when the user attempts to fast sync a new empty network.
+	// when the user attempts to snap sync a new empty network.
 	if mode == FullSync && d.stateBloom != nil {
 		d.stateBloom.Close()
 	}
-	// If snap sync was requested, create the snap scheduler and switch to fast
-	// sync mode. Long term we could drop fast sync or merge the two together,
+	// If snap sync was requested, create the snap scheduler and switch to snap
+	// sync mode. Long term we could drop snap sync or merge the two together,
 	// but until snap becomes prevalent, we should support both. TODO(karalabe).
 	if mode == SnapSync {
 		// Snap sync uses the snapshot namespace to store potentially flakey data until
@@ -443,7 +443,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}
 	if mode == SnapSync && pivot == nil {
 		// If no pivot block was returned, the head is below the min full block
-		// threshold (i.e. new chain). In that case we won't really fast sync
+		// threshold (i.e. new chain). In that case we won't really snap sync
 		// anyway, but still need a valid pivot block to avoid some code hitting
 		// nil panics on an access.
 		pivot = d.blockchain.CurrentBlock().Header()
@@ -461,7 +461,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	d.syncStatsChainHeight = height
 	d.syncStatsLock.Unlock()
 
-	// Ensure our origin point is below any fast sync pivot point
+	// Ensure our origin point is below any snap sync pivot point
 	if mode == SnapSync {
 		if height <= uint64(fsMinFullBlocks) {
 			origin = 0
@@ -471,7 +471,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 				origin = pivotNumber - 1
 			}
 			// Write out the pivot into the database so a rollback beyond it will
-			// reenable fast sync
+			// reenable snap sync
 			rawdb.WriteLastPivotNumber(d.stateDB, pivotNumber)
 		}
 	}
@@ -481,7 +481,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}
 	if mode == SnapSync {
 		// Set the ancient data limitation.
-		// If we are running fast sync, all block data older than ancientLimit will be
+		// If we are running snap sync, all block data older than ancientLimit will be
 		// written to the ancient store. More recent data will be written to the active
 		// database and will wait for the freezer to migrate.
 		//
@@ -525,8 +525,8 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 	}
 	fetchers := []func() error{
 		func() error { return d.fetchHeaders(p, origin+1) }, // Headers are always retrieved
-		func() error { return d.fetchBodies(origin + 1) },   // Bodies are retrieved during normal and fast sync
-		func() error { return d.fetchReceipts(origin + 1) }, // Receipts are retrieved during fast sync
+		func() error { return d.fetchBodies(origin + 1) },   // Bodies are retrieved during normal and snap sync
+		func() error { return d.fetchReceipts(origin + 1) }, // Receipts are retrieved during snap sync
 		func() error { return d.processHeaders(origin+1, td) },
 	}
 	if mode == SnapSync {
@@ -993,7 +993,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 				d.pivotLock.Unlock()
 
 				// Write out the pivot into the database so a rollback beyond
-				// it will reenable fast sync and update the state root that
+				// it will reenable snap sync and update the state root that
 				// the state syncer will be downloading.
 				rawdb.WriteLastPivotNumber(d.stateDB, pivot)
 			}
@@ -1018,7 +1018,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 					return errCanceled
 				}
 			}
-			// Pivot done (or not in fast sync) and no more headers, terminate the process
+			// Pivot done (or not in snap sync) and no more headers, terminate the process
 			p.log.Debug("No more headers available")
 			select {
 			case d.headerProcCh <- nil:
@@ -1077,7 +1077,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 			}
 			from += uint64(len(headers))
 
-			// If we're still skeleton filling fast sync, check pivot staleness
+			// If we're still skeleton filling snap sync, check pivot staleness
 			// before continuing to the next skeleton filling
 			if skeleton && pivot > 0 {
 				pivoting = true
@@ -1166,7 +1166,7 @@ func (d *Downloader) processHeaders(origin uint64, td *big.Int) error {
 			}
 			log.Warn("Rolled back chain segment",
 				"header", fmt.Sprintf("%d->%d", lastHeader, d.lightchain.CurrentHeader().Number),
-				"fast", fmt.Sprintf("%d->%d", lastFastBlock, curFastBlock),
+				"snap", fmt.Sprintf("%d->%d", lastFastBlock, curFastBlock),
 				"block", fmt.Sprintf("%d->%d", lastBlock, curBlock), "reason", rollbackErr)
 		}
 	}()
@@ -1207,7 +1207,7 @@ func (d *Downloader) processHeaders(origin uint64, td *big.Int) error {
 						return errStallingPeer
 					}
 				}
-				// If fast or light syncing, ensure promised headers are indeed delivered. This is
+				// If snap or light syncing, ensure promised headers are indeed delivered. This is
 				// needed to detect scenarios where an attacker feeds a bad pivot and then bails out
 				// of delivering the post-pivot blocks that would flag the invalid content.
 				//
@@ -1431,7 +1431,7 @@ func (d *Downloader) processFastSyncContent() error {
 		} else {
 			results = append(append([]*fetchResult{oldPivot}, oldTail...), results...)
 		}
-		// Split around the pivot block and process the two sides via fast/full sync
+		// Split around the pivot block and process the two sides via snap/full sync
 		if atomic.LoadInt32(&d.committed) == 0 {
 			latest := results[len(results)-1].Header
 			// If the height is above the pivot block by 2 sets, it means the pivot
@@ -1450,7 +1450,7 @@ func (d *Downloader) processFastSyncContent() error {
 				d.pivotLock.Unlock()
 
 				// Write out the pivot into the database so a rollback beyond it will
-				// reenable fast sync
+				// reenable snap sync
 				rawdb.WriteLastPivotNumber(d.stateDB, pivot.Number.Uint64())
 			}
 		}
@@ -1529,7 +1529,7 @@ func (d *Downloader) commitFastSyncData(results []*fetchResult, stateSync *state
 	}
 	// Retrieve the a batch of results to import
 	first, last := results[0].Header, results[len(results)-1].Header
-	log.Debug("Inserting fast-sync blocks", "items", len(results),
+	log.Debug("Inserting snap-sync blocks", "items", len(results),
 		"firstnum", first.Number, "firsthash", first.Hash(),
 		"lastnumn", last.Number, "lasthash", last.Hash(),
 	)
@@ -1548,7 +1548,7 @@ func (d *Downloader) commitFastSyncData(results []*fetchResult, stateSync *state
 
 func (d *Downloader) commitPivotBlock(result *fetchResult) error {
 	block := types.NewBlockWithHeader(result.Header).WithBody(result.Transactions, result.Uncles)
-	log.Debug("Committing fast sync pivot as new head", "number", block.Number(), "hash", block.Hash())
+	log.Debug("Committing snap sync pivot as new head", "number", block.Number(), "hash", block.Hash())
 
 	// Commit the pivot block as the new head, will require full sync from here on
 	if _, err := d.blockchain.InsertReceiptChain([]*types.Block{block}, []types.Receipts{result.Receipts}, d.ancientLimit); err != nil {
@@ -1561,7 +1561,7 @@ func (d *Downloader) commitPivotBlock(result *fetchResult) error {
 
 	// If we had a bloom filter for the state sync, deallocate it now. Note, we only
 	// deallocate internally, but keep the empty wrapper. This ensures that if we do
-	// a rollback after committing the pivot and restarting fast sync, we don't end
+	// a rollback after committing the pivot and restarting snap sync, we don't end
 	// up using a nil bloom. Empty bloom is fine, it just returns that it does not
 	// have the info we need, so reach down to the database instead.
 	if d.stateBloom != nil {
