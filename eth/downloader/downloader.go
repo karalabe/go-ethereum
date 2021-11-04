@@ -78,10 +78,12 @@ var (
 	errCancelStateFetch        = errors.New("state data download canceled (requested)")
 	errCancelContentProcessing = errors.New("content processing canceled (requested)")
 	errCanceled                = errors.New("syncing canceled (requested)")
-	errNoSyncActive            = errors.New("no sync active")
 	errTooOld                  = errors.New("peer's protocol version too old")
 	errNoAncestorFound         = errors.New("no common ancestor found")
 )
+
+// peerDropFn is a callback type for dropping a peer detected as malicious.
+type peerDropFn func(id string)
 
 type Downloader struct {
 	mode uint32         // Synchronisation mode defining the strategy used (per sync cycle), use d.getMode() to get the SyncMode

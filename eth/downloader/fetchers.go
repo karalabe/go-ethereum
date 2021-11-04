@@ -58,6 +58,7 @@ func (d *Downloader) fetchHeadersByHash(p *peerConnection, hash common.Hash, amo
 	case res := <-resCh:
 		// Headers successfully retrieved, update the metrics
 		headerReqTimer.Update(time.Since(start))
+		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersPacket))))
 
 		// Don't reject the packet even if it turns out to be bad, downloader will
 		// disconnect the peer on its own terms. Simply delivery the headers to
@@ -102,6 +103,7 @@ func (d *Downloader) fetchHeadersByNumber(p *peerConnection, number uint64, amou
 	case res := <-resCh:
 		// Headers successfully retrieved, update the metrics
 		headerReqTimer.Update(time.Since(start))
+		headerInMeter.Mark(int64(len(*res.Res.(*eth.BlockHeadersPacket))))
 
 		// Don't reject the packet even if it turns out to be bad, downloader will
 		// disconnect the peer on its own terms. Simply delivery the headers to

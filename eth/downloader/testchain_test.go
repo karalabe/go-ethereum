@@ -121,7 +121,5 @@ func (tc *testChain) generate(n int, seed byte, parent *types.Block, heavy bool)
 			})
 		}
 	})
-	for _, b := range blocks {
-		tc.blocks = append(tc.blocks, b)
-	}
+	tc.blocks = append(tc.blocks, blocks...)
 }

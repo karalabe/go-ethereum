@@ -670,10 +670,13 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 	// Short circuit if the data was never requested
 	request := q.headerPendPool[id]
 	if request == nil {
+		headerDropMeter.Mark(int64(len(headers)))
 		return 0, errNoFetchesPending
 	}
-	headerReqTimer.UpdateSince(request.Time)
 	delete(q.headerPendPool, id)
+
+	headerReqTimer.UpdateSince(request.Time)
+	headerInMeter.Mark(int64(len(headers)))
 
 	// Ensure headers can be mapped onto the skeleton chain
 	target := q.headerTaskPool[request.From].Hash()
@@ -709,6 +712,7 @@ func (q *queue) DeliverHeaders(id string, headers []*types.Header, headerProcCh 
 	// If the batch of headers wasn't accepted, mark as unavailable
 	if !accepted {
 		logger.Trace("Skeleton filling not accepted", "from", request.From)
+		headerDropMeter.Mark(int64(len(headers)))
 
 		miss := q.headerPeerMiss[id]
 		if miss == nil {
@@ -770,7 +774,7 @@ func (q *queue) DeliverBodies(id string, txLists [][]*types.Transaction, uncleLi
 		result.SetBodyDone()
 	}
 	return q.deliver(id, q.blockTaskPool, q.blockTaskQueue, q.blockPendPool,
-		bodyReqTimer, len(txLists), validate, reconstruct)
+		bodyReqTimer, bodyInMeter, bodyDropMeter, len(txLists), validate, reconstruct)
 }
 
 // DeliverReceipts injects a receipt retrieval response into the results queue.
@@ -791,7 +795,7 @@ func (q *queue) DeliverReceipts(id string, receiptList [][]*types.Receipt) (int,
 		result.SetReceiptsDone()
 	}
 	return q.deliver(id, q.receiptTaskPool, q.receiptTaskQueue, q.receiptPendPool,
-		receiptReqTimer, len(receiptList), validate, reconstruct)
+		receiptReqTimer, receiptInMeter, receiptDropMeter, len(receiptList), validate, reconstruct)
 }
 
 // deliver injects a data retrieval response into the results queue.
@@ -800,17 +804,21 @@ func (q *queue) DeliverReceipts(id string, receiptList [][]*types.Receipt) (int,
 // reason this lock is not obtained in here is because the parameters already need
 // to access the queue, so they already need a lock anyway.
 func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header,
-	taskQueue *prque.Prque, pendPool map[string]*fetchRequest, reqTimer metrics.Timer,
+	taskQueue *prque.Prque, pendPool map[string]*fetchRequest,
+	reqTimer metrics.Timer, resInMeter metrics.Meter, resDropMeter metrics.Meter,
 	results int, validate func(index int, header *types.Header) error,
 	reconstruct func(index int, result *fetchResult)) (int, error) {
 
 	// Short circuit if the data was never requested
 	request := pendPool[id]
 	if request == nil {
+		resDropMeter.Mark(int64(results))
 		return 0, errNoFetchesPending
 	}
-	reqTimer.UpdateSince(request.Time)
 	delete(pendPool, id)
+
+	reqTimer.UpdateSince(request.Time)
+	resInMeter.Mark(int64(results))
 
 	// If no data items were retrieved, mark them as unavailable for the origin peer
 	if results == 0 {
@@ -853,6 +861,8 @@ func (q *queue) deliver(id string, taskPool map[common.Hash]*types.Header,
 		delete(taskPool, hashes[accepted])
 		accepted++
 	}
+	resDropMeter.Mark(int64(results - accepted))
+
 	// Return all failed or missing fetches to the queue
 	for _, header := range request.Headers[accepted:] {
 		taskQueue.Push(header, -int64(header.Number.Uint64()))
