@@ -911,8 +911,7 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 
 	// Start pulling the header chain skeleton until all is done
 	var (
-		skeleton = true  // Skeleton assembly phase or finishing up
-		pivoting = false // Whether the next request is pivot verification
+		skeleton = true // Skeleton assembly phase or finishing up
 		ancestor = from
 		mode     = d.getMode()
 	)
@@ -926,14 +925,6 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 			err     error
 		)
 		switch {
-		case pivoting:
-			d.pivotLock.RLock()
-			pivot := d.pivotHeader.Number.Uint64()
-			d.pivotLock.RUnlock()
-
-			p.log.Trace("Fetching next pivot header", "number", pivot+uint64(fsMinFullBlocks))
-			headers, err = d.fetchHeadersByNumber(p, pivot+uint64(fsMinFullBlocks), 2, fsMinFullBlocks-9, false) // move +64 when it's 2x64-8 deep
-
 		case skeleton:
 			p.log.Trace("Fetching skeleton headers", "count", MaxHeaderFetch, "from", from)
 			headers, err = d.fetchHeadersByNumber(p, from+uint64(MaxHeaderFetch)-1, MaxSkeletonSize, MaxHeaderFetch-1, false)
@@ -942,32 +933,36 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 			p.log.Trace("Fetching full headers", "count", MaxHeaderFetch, "from", from)
 			headers, err = d.fetchHeadersByNumber(p, from, MaxHeaderFetch, 0, false)
 		}
-		switch err {
-		case nil:
-			// Headers retrieved, continue with processing
 
-		case errCanceled:
-			// Sync cancelled, no issue, propagate up
-			return err
+		handleFetchError := func(err error) error {
+			switch err {
+			case errCanceled:
+				// Sync cancelled, no issue, propagate up
+				return err
+			default:
+				// Header retrieval either timed out, or the peer failed in some strange way
+				// (e.g. disconnect). Consider the master peer bad and drop
+				d.dropPeer(p.id)
 
-		default:
-			// Header retrieval either timed out, or the peer failed in some strange way
-			// (e.g. disconnect). Consider the master peer bad and drop
-			d.dropPeer(p.id)
-
-			// Finish the sync gracefully instead of dumping the gathered data though
-			for _, ch := range []chan bool{d.queue.blockWakeCh, d.queue.receiptWakeCh} {
+				// Finish the sync gracefully instead of dumping the gathered data though
+				for _, ch := range []chan bool{d.queue.blockWakeCh, d.queue.receiptWakeCh} {
+					select {
+					case ch <- false:
+					case <-d.cancelCh:
+					}
+				}
 				select {
-				case ch <- false:
+				case d.headerProcCh <- nil:
 				case <-d.cancelCh:
 				}
+				return fmt.Errorf("%w: header request failed: %v", errBadPeer, err)
 			}
-			select {
-			case d.headerProcCh <- nil:
-			case <-d.cancelCh:
-			}
-			return fmt.Errorf("%w: header request failed: %v", errBadPeer, err)
 		}
+
+		if err != nil {
+			return handleFetchError(err)
+		}
+
 		// If the pivot is being checked, move if it became stale and run the real retrieval
 		var pivot uint64
 
@@ -977,32 +972,6 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 		}
 		d.pivotLock.RUnlock()
 
-		if pivoting {
-			if len(headers) == 2 {
-				if have, want := headers[0].Number.Uint64(), pivot+uint64(fsMinFullBlocks); have != want {
-					log.Warn("Peer sent invalid next pivot", "have", have, "want", want)
-					return fmt.Errorf("%w: next pivot number %d != requested %d", errInvalidChain, have, want)
-				}
-				if have, want := headers[1].Number.Uint64(), pivot+2*uint64(fsMinFullBlocks)-8; have != want {
-					log.Warn("Peer sent invalid pivot confirmer", "have", have, "want", want)
-					return fmt.Errorf("%w: next pivot confirmer number %d != requested %d", errInvalidChain, have, want)
-				}
-				log.Warn("Pivot seemingly stale, moving", "old", pivot, "new", headers[0].Number)
-				pivot = headers[0].Number.Uint64()
-
-				d.pivotLock.Lock()
-				d.pivotHeader = headers[0]
-				d.pivotLock.Unlock()
-
-				// Write out the pivot into the database so a rollback beyond
-				// it will reenable snap sync and update the state root that
-				// the state syncer will be downloading.
-				rawdb.WriteLastPivotNumber(d.stateDB, pivot)
-			}
-			// Disable the pivot check and fetch the next batch of headers
-			pivoting = false
-			continue
-		}
 		// If the skeleton's finished, pull any remaining head headers directly from the origin
 		if skeleton && len(headers) == 0 {
 			skeleton = false
@@ -1082,7 +1051,9 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 			// If we're still skeleton filling snap sync, check pivot staleness
 			// before continuing to the next skeleton filling
 			if skeleton && pivot > 0 {
-				pivoting = true
+				if err := d.updatePivot(p); err != nil {
+					return handleFetchError(err)
+				}
 			}
 			continue
 		} else {
@@ -1096,6 +1067,41 @@ func (d *Downloader) fetchHeaders(p *peerConnection, from uint64) error {
 			}
 		}
 	}
+}
+
+func (d *Downloader) updatePivot(p *peerConnection) error {
+	d.pivotLock.RLock()
+	pivot := d.pivotHeader.Number.Uint64()
+	d.pivotLock.RUnlock()
+
+	p.log.Trace("Fetching next pivot header", "number", pivot+uint64(fsMinFullBlocks))
+	headers, err := d.fetchHeadersByNumber(p, pivot+uint64(fsMinFullBlocks), 2, fsMinFullBlocks-9, false) // move +64 when it's 2x64-8 deep
+	if err != nil {
+		return err
+	}
+
+	if len(headers) == 2 {
+		if have, want := headers[0].Number.Uint64(), pivot+uint64(fsMinFullBlocks); have != want {
+			log.Warn("Peer sent invalid next pivot", "have", have, "want", want)
+			return fmt.Errorf("%w: next pivot number %d != requested %d", errInvalidChain, have, want)
+		}
+		if have, want := headers[1].Number.Uint64(), pivot+2*uint64(fsMinFullBlocks)-8; have != want {
+			log.Warn("Peer sent invalid pivot confirmer", "have", have, "want", want)
+			return fmt.Errorf("%w: next pivot confirmer number %d != requested %d", errInvalidChain, have, want)
+		}
+		log.Warn("Pivot seemingly stale, moving", "old", pivot, "new", headers[0].Number)
+		pivot = headers[0].Number.Uint64()
+
+		d.pivotLock.Lock()
+		d.pivotHeader = headers[0]
+		d.pivotLock.Unlock()
+
+		// Write out the pivot into the database so a rollback beyond
+		// it will reenable snap sync and update the state root that
+		// the state syncer will be downloading.
+		rawdb.WriteLastPivotNumber(d.stateDB, pivot)
+	}
+	return nil
 }
 
 // fillHeaderSkeleton concurrently retrieves headers from all our available peers
