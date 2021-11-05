@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 )
@@ -122,4 +123,47 @@ func (tc *testChain) generate(n int, seed byte, parent *types.Block, heavy bool)
 		}
 	})
 	tc.blocks = append(tc.blocks, blocks...)
+}
+
+var (
+	testBlockchains     = make(map[common.Hash]*testBlockchain)
+	testBlockchainsLock sync.Mutex
+)
+
+type testBlockchain struct {
+	chain *core.BlockChain
+	gen   sync.Once
+}
+
+// newTestBlockchain creates a blockchain database built by running the given blocks,
+// either actually running them, or reusing a previously created one. The returned
+// chains are *shared*, so *do not* mutate them.
+func newTestBlockchain(blocks []*types.Block) *core.BlockChain {
+	// Retrieve an existing database, or create a new one
+	head := testGenesis.Hash()
+	if len(blocks) > 0 {
+		head = blocks[len(blocks)-1].Hash()
+	}
+	testBlockchainsLock.Lock()
+	if _, ok := testBlockchains[head]; !ok {
+		testBlockchains[head] = new(testBlockchain)
+	}
+	tbc := testBlockchains[head]
+	testBlockchainsLock.Unlock()
+
+	// Ensure that the database is generated
+	tbc.gen.Do(func() {
+		db := rawdb.NewMemoryDatabase()
+		core.GenesisBlockForTesting(db, testAddress, big.NewInt(1000000000000000))
+
+		chain, err := core.NewBlockChain(db, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{}, nil, nil)
+		if err != nil {
+			panic(err)
+		}
+		if n, err := chain.InsertChain(blocks); err != nil {
+			panic(fmt.Sprintf("block %d: %v", n, err))
+		}
+		tbc.chain = chain
+	})
+	return tbc.chain
 }
