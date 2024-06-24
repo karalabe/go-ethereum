@@ -23,13 +23,16 @@ import (
 	"io"
 	"slices"
 
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-// EncodeRLP serializes a witness as RLP.
-func (w *Witness) EncodeRLP(wr io.Writer) error {
-	ext := &extwitness{
+//go:generate go run github.com/fjl/gencodec -type extWitness -field-override extWitnessMarshalling -out gen_encoding_json.go
+
+// toExtWitness converts our internal witness representation to the consensus one.
+func (w *Witness) toExtWitness() *extWitness {
+	ext := &extWitness{
 		Block:   w.Block,
 		Headers: w.Headers,
 	}
@@ -44,27 +47,50 @@ func (w *Witness) EncodeRLP(wr io.Writer) error {
 		ext.State = append(ext.State, []byte(node))
 	}
 	slices.SortFunc(ext.State, bytes.Compare)
+	return ext
+}
 
-	return rlp.Encode(wr, ext)
+// fromExtWitness converts the consensus witness format into our internal one.
+func (w *Witness) fromExtWitness(ext *extWitness) error {
+	w.Block, w.Headers = ext.Block, ext.Headers
+
+	w.Codes = make(map[string]struct{}, len(ext.Codes))
+	for _, code := range ext.Codes {
+		w.Codes[string(code)] = struct{}{}
+	}
+	w.State = make(map[string]struct{}, len(ext.State))
+	for _, node := range ext.State {
+		w.State[string(node)] = struct{}{}
+	}
+	return w.sanitize()
+}
+
+// MarshalJSON marshals a witness as JSON.
+func (w *Witness) MarshalJSON() ([]byte, error) {
+	return w.toExtWitness().MarshalJSON()
+}
+
+// EncodeRLP serializes a witness as RLP.
+func (w *Witness) EncodeRLP(wr io.Writer) error {
+	return rlp.Encode(wr, w.toExtWitness())
+}
+
+// UnmarshalJSON unmarshals from JSON.
+func (w *Witness) UnmarshalJSON(input []byte) error {
+	var ext extWitness
+	if err := ext.UnmarshalJSON(input); err != nil {
+		return err
+	}
+	return w.fromExtWitness(&ext)
 }
 
 // DecodeRLP decodes a witness from RLP.
 func (w *Witness) DecodeRLP(s *rlp.Stream) error {
-	var ew extwitness
-	if err := s.Decode(&ew); err != nil {
+	var ext extWitness
+	if err := s.Decode(&ext); err != nil {
 		return err
 	}
-	w.Block, w.Headers = ew.Block, ew.Headers
-
-	w.Codes = make(map[string]struct{}, len(ew.Codes))
-	for _, code := range ew.Codes {
-		w.Codes[string(code)] = struct{}{}
-	}
-	w.State = make(map[string]struct{}, len(ew.State))
-	for _, node := range ew.State {
-		w.State[string(node)] = struct{}{}
-	}
-	return w.sanitize()
+	return w.fromExtWitness(&ext)
 }
 
 // sanitize checks for some mandatory fields in the witness after decoding so
@@ -88,10 +114,16 @@ func (w *Witness) sanitize() error {
 	return nil
 }
 
-// extwitness is a witness RLP encoding for transferring across clients.
-type extwitness struct {
-	Block   *types.Block
-	Headers []*types.Header
-	Codes   [][]byte
-	State   [][]byte
+// extWitness is a witness RLP encoding for transferring across clients.
+type extWitness struct {
+	Block   *types.Block    `json:"block"       gencodec:"required"`
+	Headers []*types.Header `json:"headers"       gencodec:"required"`
+	Codes   [][]byte        `json:"codes"`
+	State   [][]byte        `json:"state"`
+}
+
+// extWitnessMarshalling defines the hex marshalling types for a witness.
+type extWitnessMarshalling struct {
+	Codes []hexutil.Bytes
+	State []hexutil.Bytes
 }
