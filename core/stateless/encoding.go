@@ -21,7 +21,6 @@ import (
 	"io"
 	"slices"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 )
@@ -31,7 +30,6 @@ func (w *Witness) EncodeRLP(wr io.Writer) error {
 	ext := &extwitness{
 		Block:   w.Block,
 		Headers: w.Headers,
-		Root:    w.Root,
 	}
 	ext.Codes = make([][]byte, 0, len(w.Codes))
 	for code := range w.Codes {
@@ -54,7 +52,7 @@ func (w *Witness) DecodeRLP(s *rlp.Stream) error {
 	if err := s.Decode(&ew); err != nil {
 		return err
 	}
-	w.Block, w.Headers, w.Root = ew.Block, ew.Headers, ew.Root
+	w.Block, w.Headers = ew.Block, ew.Headers
 
 	w.Codes = make(map[string]struct{}, len(ew.Codes))
 	for _, code := range ew.Codes {
@@ -73,5 +71,4 @@ type extwitness struct {
 	Headers []*types.Header
 	Codes   [][]byte
 	State   [][]byte
-	Root    common.Hash
 }

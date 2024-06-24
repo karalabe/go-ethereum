@@ -42,7 +42,6 @@ type Witness struct {
 	Headers []*types.Header     // Past headers in reverse order (0=parent, 1=parent's-parent, etc)
 	Codes   map[string]struct{} // Set of bytecodes ran or accessed
 	State   map[string]struct{} // Set of MPT state trie nodes (account and storage together)
-	Root    common.Hash         // Root hash of the pre-start to expand the MPT from
 
 	chain HeaderReader // Chain reader to convert block hash ops to header proofs
 	lock  sync.Mutex   // Lock to allow concurrent state insertions
@@ -58,11 +57,11 @@ func NewWitness(chain HeaderReader, block *types.Block, root common.Hash) *Witne
 
 	// Create the wtness with a reconstructed gutted out block
 	return &Witness{
-		Block: types.NewBlockWithHeader(header).WithBody(*block.Body()),
-		Codes: make(map[string]struct{}),
-		State: make(map[string]struct{}),
-		Root:  root,
-		chain: chain,
+		Block:   types.NewBlockWithHeader(header).WithBody(*block.Body()),
+		Codes:   make(map[string]struct{}),
+		State:   make(map[string]struct{}),
+		Headers: []*types.Header{chain.GetHeader(block.ParentHash(), block.NumberU64()-1)},
+		chain:   chain,
 	}
 }
 
@@ -109,7 +108,6 @@ func (w *Witness) Copy() *Witness {
 		Headers: slices.Clone(w.Headers),
 		Codes:   maps.Clone(w.Codes),
 		State:   maps.Clone(w.State),
-		Root:    w.Root,
 	}
 }
 
@@ -144,4 +142,9 @@ func (w *Witness) String() string {
 	fmt.Fprintf(buf, "%4d codes:        %10v\n", len(w.Codes), common.StorageSize(bytesCodes))
 
 	return buf.String()
+}
+
+// Root returns the prestate root of the witness
+func (w *Witness) Root() common.Hash {
+	return w.Headers[0].Root
 }

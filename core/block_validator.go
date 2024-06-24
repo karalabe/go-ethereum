@@ -156,6 +156,13 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 // for them to respond and then merge the results. For now, however, it's only
 // Geth, so do an internal stateless run.
 func (v *BlockValidator) ValidateWitness(witness *stateless.Witness, receiptRoot common.Hash, stateRoot common.Hash) error {
+	if len(witness.Headers) == 0 {
+		return fmt.Errorf("no ancestor headers present in witness")
+	}
+	if witness.Headers[0].Hash() != witness.Block.ParentHash() {
+		return fmt.Errorf("witness block parent hash doesn't match what is computed from parent header")
+	}
+
 	// Run the cross client stateless execution
 	// TODO(karalabe): Self-stateless for now, swap with other clients
 	crossReceiptRoot, crossStateRoot, err := ExecuteStateless(v.config, witness)
