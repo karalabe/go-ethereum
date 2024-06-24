@@ -18,6 +18,7 @@ package stateless
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -39,7 +40,7 @@ type HeaderReader interface {
 // a set of transactions and derive a post state/receipt root.
 type Witness struct {
 	Block   *types.Block        // Current block with rootHash and receiptHash zeroed out
-	Headers []*types.Header     // Past headers in reverse order (0=parent, 1=parent's-parent, etc)
+	Headers []*types.Header     // Past headers in reverse order (0=parent, 1=parent's-parent, etc). First *must* be set.
 	Codes   map[string]struct{} // Set of bytecodes ran or accessed
 	State   map[string]struct{} // Set of MPT state trie nodes (account and storage together)
 
@@ -47,22 +48,27 @@ type Witness struct {
 	lock  sync.Mutex   // Lock to allow concurrent state insertions
 }
 
-// NewWitness creates an empty witness ready for population. Note, the root arg
-// is the pre-root to apply state transitions on top, not the post-root.
-func NewWitness(chain HeaderReader, block *types.Block, root common.Hash) *Witness {
+// NewWitness creates an empty witness ready for population.
+func NewWitness(chain HeaderReader, block *types.Block) (*Witness, error) {
 	// Zero out the result fields to avoid accidentally sending them to the verifier
 	header := block.Header()
 	header.Root = common.Hash{}
 	header.ReceiptHash = common.Hash{}
 
+	// Retrieve the parent header, which will *always* be included to act as a
+	// trustless pre-root hash container
+	parent := chain.GetHeader(block.ParentHash(), block.NumberU64()-1)
+	if parent == nil {
+		return nil, errors.New("failed to retrieve parent header")
+	}
 	// Create the wtness with a reconstructed gutted out block
 	return &Witness{
 		Block:   types.NewBlockWithHeader(header).WithBody(*block.Body()),
 		Codes:   make(map[string]struct{}),
 		State:   make(map[string]struct{}),
-		Headers: []*types.Header{chain.GetHeader(block.ParentHash(), block.NumberU64()-1)},
+		Headers: []*types.Header{parent},
 		chain:   chain,
-	}
+	}, nil
 }
 
 // AddBlockHash adds a "blockhash" to the witness with the designated offset from
@@ -144,7 +150,10 @@ func (w *Witness) String() string {
 	return buf.String()
 }
 
-// Root returns the prestate root of the witness
+// Root returns the pre-state root from the first header.
+//
+// Note, this method will panic in case of a bad witness (but RLP decoding will
+// sanitize it and fail before that).
 func (w *Witness) Root() common.Hash {
 	return w.Headers[0].Root
 }

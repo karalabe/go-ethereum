@@ -1812,7 +1812,10 @@ func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool) (int, error)
 		if bc.chainConfig.IsByzantium(block.Number()) {
 			var witness *stateless.Witness
 			if bc.vmConfig.EnableWitnessCollection {
-				witness = stateless.NewWitness(bc, block, parent.Root)
+				witness, err = stateless.NewWitness(bc, block)
+				if err != nil {
+					return it.index, err
+				}
 			}
 			statedb.StartPrefetcher("chain", witness)
 		}

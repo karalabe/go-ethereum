@@ -18,6 +18,8 @@ package stateless
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"slices"
 
@@ -61,6 +63,27 @@ func (w *Witness) DecodeRLP(s *rlp.Stream) error {
 	w.State = make(map[string]struct{}, len(ew.State))
 	for _, node := range ew.State {
 		w.State[string(node)] = struct{}{}
+	}
+	return w.sanitize()
+}
+
+// sanitize checks for some mandatory fields in the witness after decoding so
+// the rest of the code can assume invariants and doesn't have to deal with
+// corrupte data.
+func (w *Witness) sanitize() error {
+	// Verify that the "parent" header (i.e. index 0) is available, and is the
+	// true parent of the blockt-to-be executed, since we use that to link the
+	// current block to the pre-state.
+	if len(w.Headers) == 0 {
+		return errors.New("parent header (for pre-root hash) missing")
+	}
+	for i, header := range w.Headers {
+		if header == nil {
+			return fmt.Errorf("witness header nil at position %d", i)
+		}
+	}
+	if w.Headers[0].Hash() != w.Block.ParentHash() {
+		return fmt.Errorf("parent hash different: witness %v, block parent %v", w.Headers[0].Hash(), w.Block.ParentHash())
 	}
 	return nil
 }
